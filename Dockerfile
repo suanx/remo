@@ -140,7 +140,7 @@ RUN cargo fetch && \
 COPY . .
 
 # 触达真实源码后重新编译（仅项目代码改变，依赖已缓存）
-RUN bash -c 'cargo build --package=remo-server --release --locked 2>&1 | tee /tmp/cargo_build.log' || (echo "=== CARGO BUILD FAILED — LAST 200 LINES ===" && tail -200 /tmp/cargo_build.log && exit 1)
+RUN cargo build --package=remo-server --release
 
 # ── 运行阶段 ──────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
