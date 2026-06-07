@@ -819,10 +819,10 @@ pub fn build_service_router(state: ServerState) -> std::io::Result<axum::Router>
             }
         };
 
-        // Serve built assets (Vite outputs to /assets/)
+        // Serve built assets (Vite outputs with base /admin/)
         let assets_path = dir.join("assets");
         if assets_path.exists() {
-            router = router.nest_service("/assets", tower_http::services::ServeDir::new(&assets_path));
+            router = router.nest_service("/admin/assets", tower_http::services::ServeDir::new(&assets_path));
         }
 
         // SPA catch-all: serve index.html for all /admin/* paths
