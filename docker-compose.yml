@@ -1,52 +1,18 @@
-# ============================================================================
-# Remo AI Agent Server — Docker Compose
-#
-# 单容器启动，内置前端 + SQLite 持久化，零外部依赖。
-# 镜像自动由 GitHub Actions 构建并推送到 ghcr.io。
-#
-# 使用方式：
-#   docker compose up -d
-#   open http://localhost:3000/admin/login
-# ============================================================================
-
 services:
-
   remo:
     image: ghcr.io/suanx/remo:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: remo
+    build: .
+    ports: ["3000:3000"]
     restart: unless-stopped
-    ports:
-      - "3000:3000"
     environment:
-      # 监听地址
-      - REMO_ADDRESS=0.0.0.0:3000
-
-      # 日志级别 (tracing/env-filter 格式)
-      - REMO_LOG=remo_server=info,remo_runtime=warn,tower_http=warn
-
-      # Admin API 鉴权 Token（必填，否则管理后台无法登录）
-      # 首次使用请修改为自定义 Token：
-      - REMO_ADMIN_API_BEARER_TOKEN=changeme-secret-token
-
-      # 数据目录 — 设置后启用 SQLite 持久化
-      - REMO_DATA_DIR=/data
-
-      # 前端静态文件目录（Dockerfile 已自动设置）
-      - REMO_STATIC_DIR=/app/static
-
-    volumes:
-      - remo-data:/data
-
+      - REMO_ADMIN_API_BEARER_TOKEN=${REMO_ADMIN_API_BEARER_TOKEN:?set this env var to login}
+      - REMO_DATA_DIR=${REMO_DATA_DIR:-/data}
+    volumes: [remo-data:/data]
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/health"]
+      test: wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/health
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
-
 volumes:
   remo-data:
-    driver: local
