@@ -201,6 +201,10 @@ pub struct ServerConfig {
     pub mailbox_lifecycle: MailboxLifecycleMode,
     #[serde(default)]
     pub eval_limits: crate::eval_limits::EvalLimits,
+    /// Directory containing pre-built frontend static files (index.html + assets/).
+    /// When set, the server will serve the admin SPA at `/admin/*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_dir: Option<String>,
 }
 
 const fn default_sse_buffer() -> usize {
