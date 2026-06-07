@@ -62,6 +62,7 @@ notifications = ["dep:remo-ext-notifications"]
 voice = ["dep:remo-ext-voice"]
 opencode = ["dep:remo-ext-opencode"]
 xfyun = ["dep:remo-ext-xfyun"]
+agnes = ["dep:remo-ext-agnes"]
 media-gen = ["dep:remo-ext-media-gen"]
 full = ["permission", "observability", "mcp", "skills", "reminder", "server", "generative-ui", "memory", "rag", "multimodal", "workflow", "sandbox", "playground", "search", "evaluator", "notifications", "voice", "opencode", "xfyun", "agnes", "media-gen"]
 

@@ -971,10 +971,9 @@ export function SettingsPage() {
             </div>
           )}
         </div>
-        </div>
 
         {/* ===== 通知通道配置 ===== */}
-        {/* ===== 通知通道配置 ===== */}
+        <div className="p-5 rounded-2xl bg-gray-900/40 border border-gray-800/40 backdrop-blur-sm space-y-5">
         <div className="p-5 rounded-2xl bg-gray-900/40 border border-gray-800/40 backdrop-blur-sm space-y-5">
           <div className="flex items-center gap-2 pb-2 border-b border-gray-800/30">
             <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
