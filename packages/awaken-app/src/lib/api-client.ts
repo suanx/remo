@@ -32,10 +32,10 @@ export class ApiClient {
   private baseUrl: string;
 
   /**
-   * @param baseUrl - API 基础路径，默认 '/api'
+  /**
+   * @param baseUrl - API 基础路径，默认 ''（与服务器同源）
    */
-  constructor(baseUrl = '/api') {
-    this.baseUrl = baseUrl.replace(/\/+$/, '');
+  constructor(baseUrl = '') {
   }
 
   /* ========== 内部工具 ========== */
