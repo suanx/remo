@@ -23,11 +23,12 @@ remo-ext-observability = { workspace = true, optional = true }
 remo-ext-mcp = { workspace = true, optional = true }
 remo-ext-skills = { workspace = true, optional = true }
 remo-ext-generative-ui = { workspace = true, optional = true }
-remo-ext-reminder = { workspace = true, optional = true }
-remo-ext-memory = { workspace = true, optional = true }
+remo-ext-deferred-tools = { workspace = true, optional = true }
+remo-ext-sandbox = { workspace = true, optional = true }
 remo-ext-rag = { workspace = true, optional = true }
-remo-ext-multimodal = { workspace = true, optional = true }
 remo-ext-workflow = { workspace = true, optional = true }
+remo-ext-memory = { workspace = true, optional = true }
+remo-ext-multimodal = { workspace = true, optional = true }
 remo-ext-playground = { workspace = true, optional = true }
 remo-ext-search = { workspace = true, optional = true }
 remo-ext-evaluator = { workspace = true, optional = true }
@@ -64,7 +65,7 @@ opencode = ["dep:remo-ext-opencode"]
 xfyun = ["dep:remo-ext-xfyun"]
 agnes = ["dep:remo-ext-agnes"]
 media-gen = ["dep:remo-ext-media-gen"]
-full = ["permission", "observability", "mcp", "skills", "reminder", "server", "generative-ui", "memory", "rag", "multimodal", "workflow", "sandbox", "playground", "search", "evaluator", "notifications", "voice", "opencode", "xfyun", "agnes", "media-gen"]
+full = ["permission", "observability", "mcp", "skills", "reminder", "deferred-tools", "server", "generative-ui", "memory", "rag", "multimodal", "workflow", "sandbox", "playground", "search", "evaluator", "notifications", "voice", "opencode", "xfyun", "agnes", "media-gen"]
 
 [dev-dependencies]
 tokio = { workspace = true }

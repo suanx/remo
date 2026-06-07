@@ -132,15 +132,14 @@ RUN mkdir -p crates/remo-server/src && \
           crates/remo-doctest/src/lib.rs \
           crates/remo-eval/src/lib.rs
 # 编译所有依赖（生成可缓存中间产物）
-RUN cargo fetch --locked
-RUN cargo build --package=remo-server --release --locked 2>&1 | tee /tmp/cargo_dep.log; exit 0
+RUN cargo fetch --locked && \
+    cargo build --package=remo-server --release --locked 2>&1 || true
 
 # 复制完整源码（覆盖伪 src）
 COPY . .
 
 # 触达真实源码后重新编译（仅项目代码改变，依赖已缓存）
-# tee 保存完整日志；fail-tail 末尾 200 行；pipefail 让 cargo 失败时 build 立即失败
-RUN bash -c 'set -o pipefail; cargo build --package=remo-server --release --locked 2>&1 | tee /tmp/cargo_real.log' || (echo "=== LAST 300 LINES OF BUILD LOG ===" && tail -300 /tmp/cargo_real.log && exit 1)
+RUN cargo build --package=remo-server --release --locked
 
 # ── 运行阶段 ──────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
