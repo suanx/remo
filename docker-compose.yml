@@ -1,22 +1,22 @@
 # ============================================================================
 # Remo AI Agent Server — Docker Compose
 #
-# 使用 SQLite 作为持久化后端，无需额外数据库服务。
-# 单容器启动，零外部依赖。
+# 单容器启动，内置前端 + SQLite 持久化，零外部依赖。
+# 镜像自动由 GitHub Actions 构建并推送到 ghcr.io。
 #
 # 使用方式：
 #   docker compose up -d
+#   open http://localhost:3000/admin/login
 # ============================================================================
 
 services:
 
-  # ── Remo AI Agent 服务器 ──────────────────────────────────────────────
-  remo-server:
-    image: ghcr.io/suanx/remo-server:latest
+  remo:
+    image: ghcr.io/suanx/remo:latest
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: remo-server
+    container_name: remo
     restart: unless-stopped
     ports:
       - "3000:3000"
@@ -27,11 +27,15 @@ services:
       # 日志级别 (tracing/env-filter 格式)
       - REMO_LOG=remo_server=info,remo_runtime=warn,tower_http=warn
 
-      # Admin API 鉴权 Token（可选，不设则 admin 路由不可用）
-      # - REMO_ADMIN_API_BEARER_TOKEN=changeme-secret-token
+      # Admin API 鉴权 Token（必填，否则管理后台无法登录）
+      # 首次使用请修改为自定义 Token：
+      - REMO_ADMIN_API_BEARER_TOKEN=changeme-secret-token
 
-      # 数据目录 — 设置后启用 SQLite 持久化（mailbox.db 存放于此）
+      # 数据目录 — 设置后启用 SQLite 持久化
       - REMO_DATA_DIR=/data
+
+      # 前端静态文件目录（Dockerfile 已自动设置）
+      - REMO_STATIC_DIR=/app/static
 
     volumes:
       - remo-data:/data
