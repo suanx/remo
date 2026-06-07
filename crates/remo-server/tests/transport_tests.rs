@@ -1,0 +1,761 @@
+//! Transport layer tests for the Remo server.
+//!
+//! Validates SSE relay, transcoder integration, channel sink behavior,
+//! and protocol-specific SSE encoding.
+
+use remo_server::http_run::{format_relay_error, wire_sse_relay};
+use remo_server::http_sse::{format_sse_data, sse_response};
+use remo_server::protocols::acp::encoder::AcpEncoder;
+use remo_server::protocols::ag_ui::encoder::AgUiEncoder;
+use remo_server::protocols::ai_sdk_v6::encoder::AiSdkEncoder;
+use remo_server::transport::transcoder::{
+    encode_epilogue_to_sse, encode_event_to_sse, encode_prologue_to_sse,
+};
+use remo_server_contract::contract::event::AgentEvent;
+use remo_server_contract::contract::lifecycle::TerminationReason;
+use remo_server_contract::contract::transport::{Identity, Transcoder};
+use bytes::Bytes;
+use futures::StreamExt;
+use serde_json::json;
+use std::convert::Infallible;
+use tokio::sync::mpsc;
+
+// ============================================================================
+// SSE data formatting
+// ============================================================================
+
+#[test]
+fn format_sse_data_produces_correct_format() {
+    let result = format_sse_data(r#"{"type":"test"}"#);
+    assert_eq!(result, Bytes::from("data: {\"type\":\"test\"}\n\n"));
+}
+
+#[test]
+fn format_sse_data_with_complex_json() {
+    let data = json!({"events": [1, 2, 3], "nested": {"key": "val"}});
+    let result = format_sse_data(&serde_json::to_string(&data).unwrap());
+    let s = String::from_utf8(result.to_vec()).unwrap();
+    assert!(s.starts_with("data: "));
+    assert!(s.ends_with("\n\n"));
+    assert!(s.contains("events"));
+}
+
+// ============================================================================
+// SSE response headers
+// ============================================================================
+
+#[test]
+fn sse_response_has_correct_headers() {
+    let stream = futures::stream::empty::<Result<Bytes, Infallible>>();
+    let response = sse_response(stream);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-cache");
+    assert_eq!(response.headers().get("connection").unwrap(), "keep-alive");
+}
+
+// ============================================================================
+// SSE body stream
+// ============================================================================
+
+#[tokio::test]
+async fn sse_body_stream_yields_all_chunks() {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let stream = remo_server::http_sse::sse_body_stream(rx);
+    tokio::pin!(stream);
+
+    tx.send(Bytes::from("a")).await.unwrap();
+    tx.send(Bytes::from("b")).await.unwrap();
+    drop(tx);
+
+    let items: Vec<Bytes> = stream.map(|r| r.unwrap()).collect().await;
+    // Filter out any heartbeat comments that may have been injected.
+    let data: Vec<Bytes> = items
+        .into_iter()
+        .filter(|b| !b.starts_with(b": heartbeat"))
+        .collect();
+    assert_eq!(data, vec![Bytes::from("a"), Bytes::from("b")]);
+}
+
+#[tokio::test]
+async fn sse_body_stream_empty_on_immediate_close() {
+    let (_tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let stream = remo_server::http_sse::sse_body_stream(rx);
+    tokio::pin!(stream);
+    drop(_tx);
+
+    let items: Vec<Bytes> = stream.map(|r| r.unwrap()).collect().await;
+    let data: Vec<Bytes> = items
+        .into_iter()
+        .filter(|b| !b.starts_with(b": heartbeat"))
+        .collect();
+    assert!(data.is_empty());
+}
+
+// ============================================================================
+// Wire SSE relay with identity encoder
+// ============================================================================
+
+#[tokio::test]
+async fn wire_sse_relay_transcodes_identity() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = Identity::<AgentEvent>::default();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::TextDelta {
+        delta: "hello".into(),
+    })
+    .unwrap();
+    drop(tx);
+
+    let chunk = sse_rx.recv().await.unwrap();
+    let chunk_str = String::from_utf8(chunk.to_vec()).unwrap();
+    assert!(chunk_str.starts_with("data: "));
+    assert!(chunk_str.contains("text_delta"));
+    assert!(chunk_str.contains("hello"));
+    assert!(chunk_str.ends_with("\n\n"));
+}
+
+#[tokio::test]
+async fn wire_sse_relay_completes_on_sender_drop() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = Identity::<AgentEvent>::default();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+    drop(tx);
+    assert!(sse_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn wire_sse_relay_multiple_events() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = Identity::<AgentEvent>::default();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::TextDelta { delta: "a".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::TextDelta { delta: "b".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::StepEnd).unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+    assert_eq!(chunks.len(), 3);
+}
+
+// ============================================================================
+// Wire SSE relay with custom transcoder (prologue/epilogue)
+// ============================================================================
+
+struct EnvelopeTranscoder {
+    seq: u64,
+}
+
+impl EnvelopeTranscoder {
+    fn new() -> Self {
+        Self { seq: 0 }
+    }
+}
+
+impl Transcoder for EnvelopeTranscoder {
+    type Input = AgentEvent;
+    type Output = serde_json::Value;
+
+    fn prologue(&mut self) -> Vec<serde_json::Value> {
+        vec![json!({"type": "stream_start"})]
+    }
+
+    fn transcode(&mut self, item: &AgentEvent) -> Vec<serde_json::Value> {
+        self.seq += 1;
+        vec![json!({
+            "seq": self.seq,
+            "event": serde_json::to_value(item).unwrap_or_default(),
+        })]
+    }
+
+    fn epilogue(&mut self) -> Vec<serde_json::Value> {
+        vec![json!({"type": "stream_end"})]
+    }
+}
+
+#[tokio::test]
+async fn wire_sse_relay_with_custom_transcoder() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = EnvelopeTranscoder::new();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::TextDelta {
+        delta: "test".into(),
+    })
+    .unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    assert_eq!(chunks.len(), 3);
+    assert!(chunks[0].contains("stream_start"));
+    assert!(chunks[1].contains("\"seq\":1"));
+    assert!(chunks[2].contains("stream_end"));
+}
+
+#[tokio::test]
+async fn wire_sse_relay_empty_stream_emits_prologue_and_epilogue() {
+    let (_tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = EnvelopeTranscoder::new();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+    drop(_tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks[0].contains("stream_start"));
+    assert!(chunks[1].contains("stream_end"));
+}
+
+// ============================================================================
+// Minimal transcoder (no prologue/epilogue)
+// ============================================================================
+
+struct MinimalEncoder;
+
+impl Transcoder for MinimalEncoder {
+    type Input = AgentEvent;
+    type Output = String;
+
+    fn transcode(&mut self, _item: &AgentEvent) -> Vec<String> {
+        vec!["evt".to_string()]
+    }
+}
+
+#[tokio::test]
+async fn wire_sse_relay_minimal_encoder() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = MinimalEncoder;
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::TextDelta { delta: "a".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::TextDelta { delta: "b".into() })
+        .unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks[0].contains("evt"));
+}
+
+// ============================================================================
+// Fanout transcoder (multiple events per input)
+// ============================================================================
+
+struct FanoutEncoder;
+
+impl Transcoder for FanoutEncoder {
+    type Input = AgentEvent;
+    type Output = String;
+
+    fn prologue(&mut self) -> Vec<String> {
+        vec!["start".to_string()]
+    }
+
+    fn transcode(&mut self, item: &AgentEvent) -> Vec<String> {
+        match item {
+            AgentEvent::TextDelta { delta } => {
+                vec![format!("text:{delta}"), format!("echo:{delta}")]
+            }
+            _ => vec!["other".to_string()],
+        }
+    }
+
+    fn epilogue(&mut self) -> Vec<String> {
+        vec!["end".to_string()]
+    }
+}
+
+#[tokio::test]
+async fn wire_sse_relay_fanout_encoder() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = FanoutEncoder;
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::TextDelta { delta: "hi".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::StepEnd).unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    // prologue(1) + text(2) + step(1) + epilogue(1) = 5
+    assert_eq!(chunks.len(), 5);
+    assert!(chunks[0].contains("start"));
+    assert!(chunks[1].contains("text:hi"));
+    assert!(chunks[2].contains("echo:hi"));
+    assert!(chunks[3].contains("other"));
+    assert!(chunks[4].contains("end"));
+}
+
+// ============================================================================
+// Format relay error
+// ============================================================================
+
+#[test]
+fn format_relay_error_is_valid_sse() {
+    let err = format_relay_error("test error");
+    let s = String::from_utf8(err.to_vec()).unwrap();
+    assert!(s.starts_with("data: "));
+    assert!(s.contains("RELAY_ERROR"));
+    assert!(s.contains("test error"));
+    assert!(s.ends_with("\n\n"));
+}
+
+// ============================================================================
+// Protocol-specific SSE encoding
+// ============================================================================
+
+#[test]
+fn encode_identity_event_to_sse() {
+    let mut encoder = Identity::<AgentEvent>::default();
+    let event = AgentEvent::TextDelta { delta: "hi".into() };
+    let frames = encode_event_to_sse(&mut encoder, &event);
+    assert_eq!(frames.len(), 1);
+    let frame = String::from_utf8(frames[0].to_vec()).unwrap();
+    assert!(frame.starts_with("data: "));
+    assert!(frame.contains("text_delta"));
+    assert!(frame.ends_with("\n\n"));
+}
+
+#[test]
+fn encode_prologue_empty_for_identity() {
+    let mut encoder = Identity::<AgentEvent>::default();
+    assert!(encode_prologue_to_sse(&mut encoder).is_empty());
+}
+
+#[test]
+fn encode_epilogue_empty_for_identity() {
+    let mut encoder = Identity::<AgentEvent>::default();
+    assert!(encode_epilogue_to_sse(&mut encoder).is_empty());
+}
+
+#[test]
+fn encode_ai_sdk_event_to_sse() {
+    let mut encoder = AiSdkEncoder::new();
+    let event = AgentEvent::TextDelta {
+        delta: "hello".into(),
+    };
+    let frames = encode_event_to_sse(&mut encoder, &event);
+    assert!(!frames.is_empty());
+    let frame = String::from_utf8(frames[0].to_vec()).unwrap();
+    assert!(frame.starts_with("data: "));
+}
+
+#[test]
+fn encode_ag_ui_event_to_sse() {
+    let mut encoder = AgUiEncoder::new();
+    encoder.on_agent_event(&AgentEvent::RunStart {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        parent_run_id: None,
+    });
+    let event = AgentEvent::TextDelta {
+        delta: "hello".into(),
+    };
+    let frames = encode_event_to_sse(&mut encoder, &event);
+    assert!(!frames.is_empty());
+}
+
+#[test]
+fn encode_acp_event_to_sse() {
+    let mut encoder = AcpEncoder::new();
+    let event = AgentEvent::TextDelta {
+        delta: "hello".into(),
+    };
+    let frames = encode_event_to_sse(&mut encoder, &event);
+    assert_eq!(frames.len(), 1);
+}
+
+// ============================================================================
+// Wire relay with AG-UI encoder
+// ============================================================================
+
+#[tokio::test]
+async fn wire_sse_relay_with_ag_ui_encoder() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = AgUiEncoder::new();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::RunStart {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        parent_run_id: None,
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::TextDelta {
+        delta: "hello".into(),
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::RunFinish {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        result: None,
+        termination: TerminationReason::NaturalEnd,
+    })
+    .unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    // RunStarted(1) + TextMessageStart(1) + TextMessageContent(1) + TextMessageEnd(1) + RunFinished(1)
+    assert!(
+        chunks.len() >= 4,
+        "expected at least 4 chunks, got {}",
+        chunks.len()
+    );
+    assert!(chunks[0].contains("RUN_STARTED"));
+    assert!(chunks.last().unwrap().contains("RUN_FINISHED"));
+}
+
+// ============================================================================
+// Wire relay with AI SDK encoder
+// ============================================================================
+
+#[tokio::test]
+async fn wire_sse_relay_with_ai_sdk_encoder() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = AiSdkEncoder::new();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::RunStart {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        parent_run_id: None,
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::TextDelta {
+        delta: "hello".into(),
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::RunFinish {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        result: None,
+        termination: TerminationReason::NaturalEnd,
+    })
+    .unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    // MessageStart + RunInfo + TextStart + TextDelta + TextEnd + Finish
+    assert!(
+        chunks.len() >= 5,
+        "expected at least 5 chunks, got {}",
+        chunks.len()
+    );
+    assert!(chunks[0].contains("start")); // MessageStart
+}
+
+// ============================================================================
+// Wire relay with ACP encoder
+// ============================================================================
+
+#[tokio::test]
+async fn wire_sse_relay_with_acp_encoder() {
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let encoder = AcpEncoder::new();
+    let mut sse_rx = wire_sse_relay(rx, encoder, 16, None);
+
+    tx.try_send(AgentEvent::TextDelta {
+        delta: "hello".into(),
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::RunFinish {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        result: None,
+        termination: TerminationReason::NaturalEnd,
+    })
+    .unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    // TextDelta → Notification + RunFinish → Finished (control signal)
+    assert!(!chunks.is_empty(), "should produce at least one SSE frame");
+    assert!(
+        chunks[0].contains("hello"),
+        "first chunk should contain text delta content"
+    );
+}
+
+// ============================================================================
+// Resumable SSE relay
+// ============================================================================
+
+#[tokio::test]
+async fn resumable_relay_frames_have_sequential_ids() {
+    use remo_server::transport::replay_buffer::EventReplayBuffer;
+    use std::sync::Arc;
+
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let buffer = Arc::new(EventReplayBuffer::new(100));
+    let mut sse_rx = wire_sse_relay(rx, Identity::<AgentEvent>::default(), 16, Some(buffer));
+
+    tx.try_send(AgentEvent::TextDelta { delta: "a".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::TextDelta { delta: "b".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::StepEnd).unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    // ADR-0034 D3: transient buffer frames omit SSE `id:` so the
+    // in-process sequence is never leaked as a durable Last-Event-ID.
+    assert_eq!(chunks.len(), 3);
+    for chunk in &chunks {
+        assert!(
+            !chunk.contains("id:"),
+            "frame must not advertise id: {chunk}"
+        );
+        assert!(
+            chunk.starts_with("data:"),
+            "frame must start with data: {chunk}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resumable_relay_populates_buffer() {
+    use remo_server::transport::replay_buffer::EventReplayBuffer;
+    use std::sync::Arc;
+
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let buffer = Arc::new(EventReplayBuffer::new(100));
+    let buffer_clone = Arc::clone(&buffer);
+    let mut sse_rx = wire_sse_relay(rx, Identity::<AgentEvent>::default(), 16, Some(buffer));
+
+    tx.try_send(AgentEvent::TextDelta { delta: "x".into() })
+        .unwrap();
+    tx.try_send(AgentEvent::TextDelta { delta: "y".into() })
+        .unwrap();
+    drop(tx);
+
+    // Drain the receiver to let the relay task finish
+    while sse_rx.recv().await.is_some() {}
+
+    assert_eq!(buffer_clone.len(), 2);
+    assert_eq!(buffer_clone.current_seq(), 2);
+}
+
+#[tokio::test]
+async fn resumable_relay_replay_after_partial_consumption() {
+    use remo_server::transport::replay_buffer::EventReplayBuffer;
+    use std::sync::Arc;
+
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let buffer = Arc::new(EventReplayBuffer::new(100));
+    let buffer_clone = Arc::clone(&buffer);
+    let mut sse_rx = wire_sse_relay(rx, Identity::<AgentEvent>::default(), 16, Some(buffer));
+
+    for i in 0..5 {
+        tx.try_send(AgentEvent::TextDelta {
+            delta: format!("msg{i}"),
+        })
+        .unwrap();
+    }
+    drop(tx);
+
+    // Drain all
+    while sse_rx.recv().await.is_some() {}
+
+    // Simulate client reconnect: "I last saw event 2". ADR-0034 D3: replay
+    // frames carry only `data:` content; server-side seq is internal.
+    let replayed = buffer_clone.replay_after(2);
+    assert_eq!(replayed.len(), 3, "should replay events 3, 4, 5");
+    assert!(String::from_utf8_lossy(&replayed[0]).contains(r#"msg2"#));
+    assert!(String::from_utf8_lossy(&replayed[1]).contains(r#"msg3"#));
+    assert!(String::from_utf8_lossy(&replayed[2]).contains(r#"msg4"#));
+}
+
+#[tokio::test]
+async fn resumable_relay_subscribe_after_catches_live_events() {
+    use remo_server::transport::replay_buffer::EventReplayBuffer;
+    use std::sync::Arc;
+
+    let buffer = Arc::new(EventReplayBuffer::new(100));
+
+    // Push some initial events
+    buffer.push_json(r#"{"n":1}"#);
+    buffer.push_json(r#"{"n":2}"#);
+    buffer.push_json(r#"{"n":3}"#);
+
+    // Client reconnects after event 1 — gets replay + live subscription
+    let (replayed, mut live_rx) = buffer.subscribe_after(1);
+    assert_eq!(replayed.len(), 2); // events 2, 3
+
+    // New event pushed after subscribe
+    buffer.push_json(r#"{"n":4}"#);
+
+    let live_frame = live_rx.recv().await.unwrap();
+    assert!(String::from_utf8_lossy(&live_frame).contains(r#""n":4"#));
+
+    // No duplicate of events 2 or 3 in live stream
+    assert!(live_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn resumable_relay_close_subscribers_terminates_stream() {
+    use remo_server::transport::replay_buffer::EventReplayBuffer;
+    use std::sync::Arc;
+
+    let buffer = Arc::new(EventReplayBuffer::new(100));
+    buffer.push_json("{}");
+
+    let (_replayed, mut live_rx) = buffer.subscribe_after(0);
+
+    // Simulate run completion
+    buffer.close_subscribers();
+
+    // Live stream should terminate (recv returns None)
+    assert!(live_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn resumable_relay_with_ai_sdk_encoder() {
+    use remo_server::transport::replay_buffer::EventReplayBuffer;
+    use std::sync::Arc;
+
+    let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+    let buffer = Arc::new(EventReplayBuffer::new(100));
+    let buffer_clone = Arc::clone(&buffer);
+    let mut sse_rx = wire_sse_relay(rx, AiSdkEncoder::new(), 16, Some(buffer));
+
+    tx.try_send(AgentEvent::RunStart {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        parent_run_id: None,
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::TextDelta {
+        delta: "hello".into(),
+    })
+    .unwrap();
+    tx.try_send(AgentEvent::RunFinish {
+        thread_id: "t1".into(),
+        run_id: "r1".into(),
+        identity: None,
+        result: None,
+        termination: TerminationReason::NaturalEnd,
+    })
+    .unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = sse_rx.recv().await {
+        chunks.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+
+    // ADR-0034 D3: frames carry only `data:` — server-side seq is internal.
+    for (i, chunk) in chunks.iter().enumerate() {
+        assert!(
+            !chunk.contains("id:"),
+            "chunk {i} must not advertise SSE id: {chunk}",
+        );
+        assert!(
+            chunk.starts_with("data:"),
+            "chunk {i} must start with data: {chunk}",
+        );
+    }
+
+    // Buffer should contain all frames
+    assert_eq!(buffer_clone.len(), chunks.len());
+
+    // Replay all from 0 should return same count
+    let replayed = buffer_clone.replay_after(0);
+    assert_eq!(replayed.len(), chunks.len());
+}
+
+// ============================================================================
+// Channel sink behavior
+// ============================================================================
+
+#[tokio::test]
+async fn channel_sink_forwards_events() {
+    use remo_server::transport::channel_sink::ChannelEventSink;
+    use remo_server_contract::contract::event_sink::EventSink;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sink = ChannelEventSink::new(tx);
+
+    sink.emit(AgentEvent::TextDelta {
+        delta: "hello".into(),
+    })
+    .await;
+    sink.emit(AgentEvent::StepEnd).await;
+
+    let e1 = rx.recv().await.unwrap();
+    assert!(matches!(e1, AgentEvent::TextDelta { delta } if delta == "hello"));
+    let e2 = rx.recv().await.unwrap();
+    assert!(matches!(e2, AgentEvent::StepEnd));
+}
+
+#[tokio::test]
+async fn channel_sink_drops_silently_on_closed_receiver() {
+    use remo_server::transport::channel_sink::ChannelEventSink;
+    use remo_server_contract::contract::event_sink::EventSink;
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let sink = ChannelEventSink::new(tx);
+    drop(rx);
+
+    // Should not panic
+    sink.emit(AgentEvent::TextDelta {
+        delta: "ignored".into(),
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn channel_sink_close_is_noop() {
+    use remo_server::transport::channel_sink::ChannelEventSink;
+    use remo_server_contract::contract::event_sink::EventSink;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let sink = ChannelEventSink::new(tx);
+    sink.close().await;
+}

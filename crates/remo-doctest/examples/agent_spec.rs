@@ -1,0 +1,26 @@
+//! Construct `AgentSpec` + `ProviderSpec` + `ModelSpec` — verifies
+//! the config-plane shapes docs cite in `reference/config` and
+//! `reference/provider-model-config` still match the crate.
+
+use remo::registry_spec::{AgentSpec, ModelSpec, ProviderSpec};
+
+fn main() {
+    let _provider = ProviderSpec {
+        id: "openai".into(),
+        adapter: "openai".into(),
+        ..Default::default()
+    };
+
+    /* Use the constructor instead of a struct literal so future fields
+     * (pricing, capabilities) don't force every example to recompile.
+     * The constructor sets all optional fields to their canonical
+     * defaults. */
+    let _model = ModelSpec::new("gpt-4o-mini", "openai", "gpt-4o-mini");
+
+    let _agent = AgentSpec {
+        id: "assistant".into(),
+        model_id: "gpt-4o-mini".into(),
+        system_prompt: "You are a helpful assistant.".into(),
+        ..Default::default()
+    };
+}

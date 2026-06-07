@@ -1,0 +1,30 @@
+[package]
+name = "remo-server-contract"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Server and store boundary contracts for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+async-trait = { workspace = true }
+base64 = "0.22"
+futures = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

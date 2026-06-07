@@ -1,0 +1,44 @@
+[package]
+name = "remo-ext-skills"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Skill package discovery and activation plugin for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "development-tools"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+remo-tool-pattern = { workspace = true }
+remo-ext-mcp = { workspace = true, optional = true }
+remo-ext-deferred-tools = { workspace = true }
+remo-ext-permission = { workspace = true }
+serde = { workspace = true }
+schemars = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["time", "process", "fs"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+remo-ext-mcp = { workspace = true }
+remo-runtime = { workspace = true, features = ["test-utils"] }
+mcp = { workspace = true, features = ["client"] }
+
+[features]
+default = []
+mcp = ["dep:remo-ext-mcp"]
+
+[lints]
+workspace = true

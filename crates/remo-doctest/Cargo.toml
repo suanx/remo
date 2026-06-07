@@ -1,0 +1,154 @@
+[package]
+name = "remo-doctest"
+version.workspace = true
+edition.workspace = true
+description = "Compile-tests for Remo documentation code examples"
+license.workspace = true
+publish = false
+
+# Deps are dev-side: examples below live in `examples/` and exercise the
+# public surfaces that user docs reference. `cargo build --examples` and
+# `cargo test --examples` catch API drift without coupling test status to
+# Markdown formatting (the prior `book_doctests!()` macro was retired by
+# the Starlight migration — see lib.rs for history).
+
+# `harness = false` is load-bearing: without it `cargo test --examples`
+# silently replaces each example's `fn main()` with the libtest harness, so
+# runtime asserts in main() (e.g. `effect_spec`'s decode round-trip) are
+# only type-checked, never executed. With harness disabled, the example's
+# `main()` *is* the test entry point — a runtime panic fails CI.
+# Mirror this list when adding a new example under `examples/`.
+[[example]]
+name = "tool_basic"
+path = "examples/tool_basic.rs"
+test = true
+harness = false
+
+[[example]]
+name = "typed_tool"
+path = "examples/typed_tool.rs"
+test = true
+harness = false
+
+[[example]]
+name = "agent_spec"
+path = "examples/agent_spec.rs"
+test = true
+harness = false
+
+[[example]]
+name = "effect_spec"
+path = "examples/effect_spec.rs"
+test = true
+harness = false
+
+[[example]]
+name = "skill_spec"
+path = "examples/skill_spec.rs"
+test = true
+harness = false
+
+[[example]]
+name = "state_key"
+path = "examples/state_key.rs"
+test = true
+harness = false
+
+[[example]]
+name = "cancellation"
+path = "examples/cancellation.rs"
+test = true
+harness = false
+
+[[example]]
+name = "error_variants"
+path = "examples/error_variants.rs"
+test = true
+harness = false
+
+[[example]]
+name = "run_lifecycle"
+path = "examples/run_lifecycle.rs"
+test = true
+harness = false
+
+[[example]]
+name = "tool_resume"
+path = "examples/tool_resume.rs"
+test = true
+harness = false
+
+[[example]]
+name = "event_sink"
+path = "examples/event_sink.rs"
+test = true
+harness = false
+
+[[example]]
+name = "remote_endpoint"
+path = "examples/remote_endpoint.rs"
+test = true
+harness = false
+
+[[example]]
+name = "scheduled_action"
+path = "examples/scheduled_action.rs"
+test = true
+harness = false
+
+[[example]]
+name = "state_command"
+path = "examples/state_command.rs"
+test = true
+harness = false
+
+[[example]]
+name = "plugin_registrar"
+path = "examples/plugin_registrar.rs"
+test = true
+harness = false
+
+[[example]]
+name = "thread_store_trait"
+path = "examples/thread_store_trait.rs"
+test = true
+harness = false
+
+[[example]]
+name = "mcp_server_spec"
+path = "examples/mcp_server_spec.rs"
+test = true
+harness = false
+
+[[example]]
+name = "deferred_tool"
+path = "examples/deferred_tool.rs"
+test = true
+harness = false
+
+[[example]]
+name = "ai_sdk_payloads"
+path = "examples/ai_sdk_payloads.rs"
+test = true
+harness = false
+
+[[example]]
+name = "http_app_builder"
+path = "examples/http_app_builder.rs"
+test = true
+harness = false
+
+[dev-dependencies]
+remo = { package = "remo", version = "0.5.1-dev", path = "../remo", features = ["full"] }
+remo-contract = { path = "../remo-contract" }
+remo-runtime = { path = "../remo-runtime" }
+remo-server = { path = "../remo-server" }
+remo-ext-deferred-tools = { path = "../remo-ext-deferred-tools" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

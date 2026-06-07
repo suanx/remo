@@ -1,0 +1,24 @@
+[package]
+name = "remo-ext-sandbox"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Process-level sandbox plugin for secure tool execution in Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "security"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

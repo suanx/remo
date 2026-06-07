@@ -1,0 +1,34 @@
+[package]
+name = "remo-agent"
+version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/remo-agent"
+edition.workspace = true
+description = "Compatibility umbrella crate re-exporting remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "asynchronous"]
+
+[lib]
+name = "remo"
+doc = false
+doctest = false
+
+[dependencies]
+remo_core = { package = "remo", version = "0.5.1-dev", path = "../remo", default-features = false }
+
+[features]
+default = ["full"]
+permission = ["remo_core/permission"]
+observability = ["remo_core/observability"]
+mcp = ["remo_core/mcp"]
+skills = ["remo_core/skills"]
+reminder = ["remo_core/reminder"]
+server = ["remo_core/server"]
+generative-ui = ["remo_core/generative-ui"]
+full = ["remo_core/full"]
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "remo-ext-multimodal"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Multimodal support extension with file parsing, content handling, and image description for Remo AI Agent framework"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "multimedia"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+base64 = "0.22"
+
+[lints]
+workspace = true

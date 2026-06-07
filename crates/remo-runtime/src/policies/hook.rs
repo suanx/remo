@@ -1,0 +1,149 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::hooks::{PhaseContext, PhaseHook};
+use crate::state::StateCommand;
+use remo_runtime_contract::StateError;
+use remo_runtime_contract::contract::lifecycle::TerminationReason;
+use remo_runtime_contract::now_ms;
+
+use super::policy::{StopDecision, StopPolicy, StopPolicyStats};
+use super::state::{StopConditionStatsKey, StopConditionStatsState};
+use crate::agent::state::{RunLifecycle, RunLifecycleUpdate};
+
+const MAX_RESPONSE_HISTORY: usize = 64;
+
+/// Initializes run-scoped stop-condition stats before the first inference.
+pub(super) struct StopConditionStartHook;
+
+impl StopConditionStartHook {
+    fn next_state(ctx: &PhaseContext) -> StopConditionStatsState {
+        let mut state = ctx
+            .state::<StopConditionStatsKey>()
+            .cloned()
+            .unwrap_or_default();
+        if state.start_time_ms == 0 {
+            state.start_time_ms = now_ms();
+        }
+        state
+    }
+}
+
+#[async_trait]
+impl PhaseHook for StopConditionStartHook {
+    async fn run(&self, ctx: &PhaseContext) -> Result<StateCommand, StateError> {
+        let mut cmd = StateCommand::new();
+        cmd.update::<StopConditionStatsKey>(Self::next_state(ctx));
+        Ok(cmd)
+    }
+}
+
+/// Internal hook that builds stats from state and evaluates all policies.
+pub(super) struct StopConditionHook {
+    pub(super) policies: Vec<Arc<dyn StopPolicy>>,
+}
+
+impl StopConditionHook {
+    fn build_stats(&self, ctx: &PhaseContext) -> (StopConditionStatsState, StopPolicyStats) {
+        let now = now_ms();
+        let mut state = ctx
+            .state::<StopConditionStatsKey>()
+            .cloned()
+            .unwrap_or_default();
+        if state.start_time_ms == 0 {
+            state.start_time_ms = now;
+        }
+
+        // This hook runs once per AfterInference boundary.
+        state.step_count = state.step_count.saturating_add(1);
+
+        let mut last_tool_names = Vec::new();
+        let mut last_response_text = String::new();
+        let mut is_error = false;
+
+        if let Some(ref response) = ctx.llm_response {
+            match &response.outcome {
+                Ok(stream_result) => {
+                    let input = stream_result
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.prompt_tokens)
+                        .unwrap_or(0) as u64;
+                    let output = stream_result
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.completion_tokens)
+                        .unwrap_or(0) as u64;
+                    state.total_input_tokens = state.total_input_tokens.saturating_add(input);
+                    state.total_output_tokens = state.total_output_tokens.saturating_add(output);
+
+                    last_response_text = stream_result.text();
+                    if !last_response_text.is_empty() {
+                        state.recent_response_texts.push(last_response_text.clone());
+                        if state.recent_response_texts.len() > MAX_RESPONSE_HISTORY {
+                            let excess = state.recent_response_texts.len() - MAX_RESPONSE_HISTORY;
+                            state.recent_response_texts.drain(0..excess);
+                        }
+                    }
+                    last_tool_names = stream_result
+                        .tool_calls
+                        .iter()
+                        .map(|tc| tc.name.clone())
+                        .collect();
+
+                    // Successful inference resets consecutive errors
+                    state.consecutive_errors = 0;
+                }
+                Err(_) => {
+                    is_error = true;
+                    state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+                }
+            }
+        }
+
+        let elapsed_ms = now.saturating_sub(state.start_time_ms);
+        let consecutive_errors = if is_error {
+            state.consecutive_errors
+        } else {
+            0
+        };
+
+        (
+            state.clone(),
+            StopPolicyStats {
+                step_count: state.step_count,
+                total_input_tokens: state.total_input_tokens,
+                total_output_tokens: state.total_output_tokens,
+                elapsed_ms,
+                consecutive_errors,
+                last_tool_names,
+                last_response_text,
+                recent_response_texts: state.recent_response_texts.clone(),
+            },
+        )
+    }
+}
+
+#[async_trait]
+impl PhaseHook for StopConditionHook {
+    async fn run(&self, ctx: &PhaseContext) -> Result<StateCommand, StateError> {
+        let (next_state, stats) = self.build_stats(ctx);
+        let mut cmd = StateCommand::new();
+        cmd.update::<StopConditionStatsKey>(next_state);
+
+        for policy in &self.policies {
+            if let StopDecision::Stop { code, detail } = policy.evaluate(&stats) {
+                let reason = TerminationReason::stopped_with_detail(code, detail);
+                let (_, done_reason) = reason.to_run_status();
+                cmd.update::<RunLifecycle>(RunLifecycleUpdate::Done {
+                    done_reason: done_reason.unwrap_or_default(),
+                    updated_at: now_ms(),
+                });
+                return Ok(cmd);
+            }
+        }
+
+        Ok(cmd)
+    }
+}

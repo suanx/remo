@@ -1,0 +1,30 @@
+//! Model Context Protocol (MCP) client integration for external tool servers.
+//!
+//! Provides [`McpToolRegistryManager`] for connecting to MCP servers and
+//! exposing their tools as remo [`Tool`](remo_runtime_contract::contract::tool::Tool) instances.
+
+pub mod config;
+pub mod error;
+pub mod id_mapping;
+pub mod manager;
+pub mod plugin;
+pub mod progress;
+pub mod sampling;
+pub mod transport;
+
+pub use config::{McpServerConnectionConfig, TransportTypeId};
+pub use error::McpError;
+pub use manager::{
+    McpPromptEntry, McpRefreshHealth, McpResourceEntry, McpServerStatusSnapshot,
+    McpServerToolEntry, McpToolRegistry, McpToolRegistryManager, ResourceUpdated,
+};
+pub use plugin::McpPlugin;
+pub use progress::McpProgressUpdate;
+pub use sampling::{
+    DefaultSamplingHandler, FixedSamplingHandlerFactory, SamplingHandler, SamplingHandlerFactory,
+};
+pub use transport::{
+    ListChangedKind, McpCallContext, McpCallMetadata, McpCallSampling, McpPromptArgument,
+    McpPromptDefinition, McpPromptMessage, McpPromptResult, McpResourceDefinition,
+    McpToolTransport,
+};

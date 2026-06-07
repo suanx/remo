@@ -1,0 +1,583 @@
+//! NDJSON report writer + baseline diff.
+//!
+//! A *report* is a directory or file (NDJSON, one [`ReplayReport`] per
+//! line) emitted by the `remo-eval replay` command.  CI gates use
+//! [`diff_against_baseline`] to compare a fresh report against a committed
+//! baseline and surface any regressions.
+//!
+//! NDJSON is chosen over a single JSON document so reports stream as
+//! fixtures execute and partial reports are still parseable when a run is
+//! interrupted.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::outcome::ReplayReport;
+
+/// Errors raised while reading or writing reports.
+#[derive(Debug, Error)]
+pub enum ReportError {
+    #[error("report I/O failed: {path}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("report contains invalid JSON at line {line}")]
+    Parse {
+        line: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Serialise `reports` as NDJSON to `writer`.
+pub fn write_ndjson<W: Write>(
+    writer: &mut W,
+    reports: &[ReplayReport],
+) -> Result<(), std::io::Error> {
+    for r in reports {
+        let line = serde_json::to_string(r).expect("ReplayReport serializes infallibly");
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
+}
+
+/// Convenience wrapper that creates `path` (and any missing parents) and
+/// writes the report.
+pub fn write_ndjson_path(
+    path: impl AsRef<Path>,
+    reports: &[ReplayReport],
+) -> Result<(), ReportError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|source| ReportError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut file = fs::File::create(path).map_err(|source| ReportError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    write_ndjson(&mut file, reports).map_err(|source| ReportError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Parse NDJSON from `reader`.
+///
+/// Blank lines are tolerated so editors that auto-append a trailing newline
+/// don't break parsing.
+pub fn read_ndjson<R: BufRead>(reader: R) -> Result<Vec<ReplayReport>, ReportError> {
+    let mut reports = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.map_err(|source| ReportError::Io {
+            path: std::path::PathBuf::from("<reader>"),
+            source,
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let report = serde_json::from_str(&line).map_err(|source| ReportError::Parse {
+            line: idx + 1,
+            source,
+        })?;
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+/// Read NDJSON from a file on disk.
+pub fn read_ndjson_path(path: impl AsRef<Path>) -> Result<Vec<ReplayReport>, ReportError> {
+    let path = path.as_ref();
+    let file = fs::File::open(path).map_err(|source| ReportError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    read_ndjson(BufReader::new(file))
+}
+
+/// One row of the baseline-vs-new comparison.
+///
+/// Every variant carries an optional `cell: Option<MatrixCell>`. For
+/// non-matrix runs (CLI `remo-eval check`, dataset runs without a
+/// `models` axis) the field stays `None` and the wire shape is
+/// unchanged. For matrix runs the diff pairer keys by
+/// `(fixture_id, cell)` so two cells of the same fixture stay
+/// independent entries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffEntry {
+    /// Both reports are present, both `passed`, and every observable
+    /// metric matched. No change.
+    Unchanged {
+        fixture_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+    /// Baseline passed but the new run failed — a *regression*.
+    Regression {
+        fixture_id: String,
+        new_failures: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+    /// Baseline failed but the new run passed — a *fix*.
+    Fixed {
+        fixture_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+    /// Both runs failed; failure set differs.
+    StillFailing {
+        fixture_id: String,
+        new_failures: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+    /// Both runs passed but at least one observable metric drifted
+    /// (final text, token counts, tool counts, error_type, etc.).
+    /// Surfaces silent regressions that don't change the pass/fail bit
+    /// — e.g. an inference being dropped from `inference_count` while
+    /// the answer-substring expectation still happens to match.
+    Drift {
+        fixture_id: String,
+        fields: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+    /// Fixture only present in the baseline (deleted or filtered).
+    MissingFromNew {
+        fixture_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+    /// Fixture only present in the new run (added).
+    NewlyAdded {
+        fixture_id: String,
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<crate::eval_run::MatrixCell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_index: Option<u32>,
+    },
+}
+
+impl DiffEntry {
+    pub fn fixture_id(&self) -> &str {
+        match self {
+            DiffEntry::Unchanged { fixture_id, .. }
+            | DiffEntry::Regression { fixture_id, .. }
+            | DiffEntry::Fixed { fixture_id, .. }
+            | DiffEntry::StillFailing { fixture_id, .. }
+            | DiffEntry::Drift { fixture_id, .. }
+            | DiffEntry::MissingFromNew { fixture_id, .. }
+            | DiffEntry::NewlyAdded { fixture_id, .. } => fixture_id,
+        }
+    }
+
+    /// Matrix cell that produced this entry. `None` for non-matrix runs.
+    pub fn cell(&self) -> Option<&crate::eval_run::MatrixCell> {
+        match self {
+            DiffEntry::Unchanged { cell, .. }
+            | DiffEntry::Regression { cell, .. }
+            | DiffEntry::Fixed { cell, .. }
+            | DiffEntry::StillFailing { cell, .. }
+            | DiffEntry::Drift { cell, .. }
+            | DiffEntry::MissingFromNew { cell, .. }
+            | DiffEntry::NewlyAdded { cell, .. } => cell.as_ref(),
+        }
+    }
+
+    /// Zero-based sample index when produced by a flakiness-sampling run.
+    /// `None` for default single-sample runs.
+    pub fn sample_index(&self) -> Option<u32> {
+        match self {
+            DiffEntry::Unchanged { sample_index, .. }
+            | DiffEntry::Regression { sample_index, .. }
+            | DiffEntry::Fixed { sample_index, .. }
+            | DiffEntry::StillFailing { sample_index, .. }
+            | DiffEntry::Drift { sample_index, .. }
+            | DiffEntry::MissingFromNew { sample_index, .. }
+            | DiffEntry::NewlyAdded { sample_index, .. } => *sample_index,
+        }
+    }
+
+    /// Whether this entry should fail a CI gate. Regressions, missing
+    /// fixtures, field-level drift, and newly-added *failing* fixtures
+    /// are blocking — drift is included because a silently changing
+    /// baseline is exactly the kind of slow regression the eval gate
+    /// exists to catch; a newly added failing fixture is included so
+    /// `remo-eval check` actually fails when a fresh fixture lands in
+    /// a broken state (otherwise the gate would only catch already-
+    /// committed-passing fixtures going red).
+    pub fn is_blocking(&self) -> bool {
+        match self {
+            DiffEntry::Regression { .. }
+            | DiffEntry::MissingFromNew { .. }
+            | DiffEntry::Drift { .. } => true,
+            DiffEntry::NewlyAdded { passed, .. } => !*passed,
+            DiffEntry::Unchanged { .. }
+            | DiffEntry::Fixed { .. }
+            | DiffEntry::StillFailing { .. } => false,
+        }
+    }
+}
+
+/// Field names compared between two passing reports. Order is stable so
+/// `Drift::fields` reads consistently across runs.
+fn diff_passing_fields(b: &ReplayReport, n: &ReplayReport) -> Vec<String> {
+    let mut diffs: Vec<&'static str> = Vec::new();
+    if b.final_text != n.final_text {
+        diffs.push("final_text");
+    }
+    if b.inference_count != n.inference_count {
+        diffs.push("inference_count");
+    }
+    if b.tool_count != n.tool_count {
+        diffs.push("tool_count");
+    }
+    if b.tool_failures != n.tool_failures {
+        diffs.push("tool_failures");
+    }
+    if b.total_input_tokens != n.total_input_tokens {
+        diffs.push("total_input_tokens");
+    }
+    if b.total_output_tokens != n.total_output_tokens {
+        diffs.push("total_output_tokens");
+    }
+    if b.total_tokens != n.total_tokens {
+        diffs.push("total_tokens");
+    }
+    // `session_duration_ms` excluded from drift: it's wall-clock-derived
+    // (RunEndHook records `start.elapsed()` at run end), so two replays
+    // of the same scripted fixture produce different microsecond values
+    // and `diff_against_baseline` would surface false-positive drift —
+    // see `diff_detects_newly_added_without_blocking` CI flake history.
+    // Behavioral drift is already covered by inference_count + tool_count
+    // + token counts; performance drift belongs in a separate metric
+    // surface (trend route or runtime_stats), not this regression gate.
+    if b.error_type != n.error_type {
+        diffs.push("error_type");
+    }
+    if b.inference_error_count != n.inference_error_count {
+        diffs.push("inference_error_count");
+    }
+    if b.runtime_failure != n.runtime_failure {
+        diffs.push("runtime_failure");
+    }
+    if b.tool_calls_by_agent != n.tool_calls_by_agent {
+        diffs.push("tool_calls_by_agent");
+    }
+    // `cost_usd` is Option<f64>; bit-equality is enough because both
+    // sides compute via the same compute_cost_usd path. A price bump
+    // or token drift turns a passing run into a Drift entry — exactly
+    // what a regression diff should catch.
+    if b.cost_usd != n.cost_usd {
+        diffs.push("cost_usd");
+    }
+    // Revise loop diagnostics: an agent that now needs more retries to
+    // clear the judge threshold is a softer regression than outright
+    // failure, but still worth surfacing in drift.
+    if b.revision_count != n.revision_count {
+        diffs.push("revision_count");
+    }
+    if b.judge_score != n.judge_score {
+        diffs.push("judge_score");
+    }
+    diffs.into_iter().map(String::from).collect()
+}
+
+/// Aggregate result of a baseline diff.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffSummary {
+    pub entries: Vec<DiffEntry>,
+}
+
+impl DiffSummary {
+    /// True when no entry would fail a CI gate.
+    pub fn is_clean(&self) -> bool {
+        !self.entries.iter().any(DiffEntry::is_blocking)
+    }
+
+    /// Count of regressions (baseline passed, new failed).
+    pub fn regressions(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e, DiffEntry::Regression { .. }))
+            .count()
+    }
+
+    /// Count of fixtures missing from the new run.
+    pub fn missing(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e, DiffEntry::MissingFromNew { .. }))
+            .count()
+    }
+
+    /// Count of fixtures newly added in the new run.
+    pub fn added(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e, DiffEntry::NewlyAdded { .. }))
+            .count()
+    }
+
+    /// Count of fixtures with field-level drift (both runs passed but
+    /// at least one observable metric changed).
+    pub fn drift(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e, DiffEntry::Drift { .. }))
+            .count()
+    }
+}
+
+/// Compare a `new` run against a committed `baseline`, producing a
+/// Reject duplicate `fixture_id` values in a [`ReplayReport`] slice.
+/// `diff_against_baseline` collects reports into a `BTreeMap` keyed by
+/// fixture_id; without this guard, duplicates would silently overwrite
+/// each other and the diff would depend on Vec insertion order. Callers
+/// (server compute_diff, CLI `check`) invoke this before the diff so a
+/// corrupt baseline or report file fails loud instead of producing a
+/// plausible-looking but order-dependent answer.
+pub fn validate_unique_report_keys(reports: &[ReplayReport]) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<&str> = HashSet::with_capacity(reports.len());
+    for r in reports {
+        if !seen.insert(r.fixture_id.as_str()) {
+            return Err(format!("duplicate report fixture_id: {}", r.fixture_id));
+        }
+    }
+    Ok(())
+}
+
+/// Reject duplicate `(fixture_id, cell, sample_index)` keys in an
+/// `EvalRunItem` slice. Counterpart to `validate_unique_report_keys`
+/// for the matrix-aware `diff_eval_items` path.
+pub fn validate_unique_item_keys(items: &[crate::eval_run::EvalRunItem]) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, crate::eval_run::MatrixCell, Option<u32>)> =
+        HashSet::with_capacity(items.len());
+    for it in items {
+        let key = (
+            it.fixture_id.clone(),
+            it.cell.clone().unwrap_or_default(),
+            it.sample_index,
+        );
+        let label = format!(
+            "(fixture_id={}, cell={:?}, sample_index={:?})",
+            it.fixture_id, it.cell, it.sample_index
+        );
+        if !seen.insert(key) {
+            return Err(format!("duplicate eval-run item key: {label}"));
+        }
+    }
+    Ok(())
+}
+
+/// Fallible variant of [`diff_against_baseline`] — validates that both
+/// slices have unique `fixture_id`s BEFORE collecting into the
+/// `BTreeMap` that powers the diff. New call sites should prefer this;
+/// the infallible version is kept for back-compat with consumers that
+/// have already validated their inputs.
+pub fn diff_against_baseline_checked(
+    baseline: &[ReplayReport],
+    new: &[ReplayReport],
+) -> Result<DiffSummary, String> {
+    validate_unique_report_keys(baseline).map_err(|e| format!("baseline: {e}"))?;
+    validate_unique_report_keys(new).map_err(|e| format!("new: {e}"))?;
+    Ok(diff_against_baseline(baseline, new))
+}
+
+/// Fallible variant of [`diff_eval_items`] — same guard as
+/// [`diff_against_baseline_checked`] but for the matrix-aware
+/// `(fixture_id, cell, sample_index)` key.
+pub fn diff_eval_items_checked(
+    baseline: &[crate::eval_run::EvalRunItem],
+    new: &[crate::eval_run::EvalRunItem],
+) -> Result<DiffSummary, String> {
+    validate_unique_item_keys(baseline).map_err(|e| format!("baseline: {e}"))?;
+    validate_unique_item_keys(new).map_err(|e| format!("new: {e}"))?;
+    Ok(diff_eval_items(baseline, new))
+}
+
+/// [`DiffSummary`] suitable for CI gating.
+///
+/// Pairing is by `fixture_id`. The returned `entries` are sorted by id.
+pub fn diff_against_baseline(baseline: &[ReplayReport], new: &[ReplayReport]) -> DiffSummary {
+    let baseline_map: BTreeMap<&str, &ReplayReport> = baseline
+        .iter()
+        .map(|r| (r.fixture_id.as_str(), r))
+        .collect();
+    let new_map: BTreeMap<&str, &ReplayReport> =
+        new.iter().map(|r| (r.fixture_id.as_str(), r)).collect();
+
+    let mut all_ids: Vec<&str> = baseline_map.keys().copied().collect();
+    for id in new_map.keys() {
+        if !all_ids.contains(id) {
+            all_ids.push(id);
+        }
+    }
+    all_ids.sort();
+
+    let entries = all_ids
+        .into_iter()
+        .map(|id| {
+            pair_to_entry(
+                id.to_string(),
+                None,
+                None,
+                baseline_map.get(id).copied(),
+                new_map.get(id).copied(),
+            )
+        })
+        .collect();
+
+    DiffSummary { entries }
+}
+
+/// Pair eval-run items by `(fixture_id, cell, sample_index)` for
+/// matrix/sample-aware comparison, then produce a [`DiffSummary`]. Two
+/// cells or samples of the same fixture become independent entries — a
+/// regression in `(alpha, claude-opus, sample 1)` doesn't collide with
+/// `(alpha, gpt-4o, sample 0)`. Used by the server's `compute_diff`
+/// when at least one item carries a matrix cell or sample index. CLI
+/// `remo-eval check` keeps using the `ReplayReport`-based
+/// [`diff_against_baseline`] for its NDJSON flow.
+pub fn diff_eval_items(
+    baseline: &[crate::eval_run::EvalRunItem],
+    new: &[crate::eval_run::EvalRunItem],
+) -> DiffSummary {
+    // `(fixture_id, cell, sample_index)` — sample_index defaults to None
+    // (= single-sample run) so legacy diffs key identically to before.
+    // Including the field is what keeps three samples of the same
+    // (fixture, cell) from silently collapsing in a map.
+    type Key = (String, crate::eval_run::MatrixCell, Option<u32>);
+    let key_of = |item: &crate::eval_run::EvalRunItem| -> Key {
+        (
+            item.fixture_id.clone(),
+            item.cell.clone().unwrap_or_default(),
+            item.sample_index,
+        )
+    };
+
+    let baseline_map: BTreeMap<Key, &crate::eval_run::EvalRunItem> =
+        baseline.iter().map(|i| (key_of(i), i)).collect();
+    let new_map: BTreeMap<Key, &crate::eval_run::EvalRunItem> =
+        new.iter().map(|i| (key_of(i), i)).collect();
+
+    let mut all_keys: Vec<Key> = baseline_map.keys().cloned().collect();
+    for k in new_map.keys() {
+        if !all_keys.contains(k) {
+            all_keys.push(k.clone());
+        }
+    }
+    all_keys.sort();
+
+    let entries = all_keys
+        .into_iter()
+        .map(|key| {
+            let (fixture_id, cell, sample_index) = &key;
+            let cell_opt = if *cell == crate::eval_run::MatrixCell::default() {
+                None
+            } else {
+                Some(cell.clone())
+            };
+            let b = baseline_map.get(&key).map(|i| &i.report);
+            let n = new_map.get(&key).map(|i| &i.report);
+            pair_to_entry(fixture_id.clone(), cell_opt, *sample_index, b, n)
+        })
+        .collect();
+
+    DiffSummary { entries }
+}
+
+/// Inner pairing logic shared by [`diff_against_baseline`] (cell = None)
+/// and [`diff_eval_items`] (cell may be set). Keeps the four-quadrant
+/// pass/fail × pass/fail decision in one place.
+fn pair_to_entry(
+    fixture_id: String,
+    cell: Option<crate::eval_run::MatrixCell>,
+    sample_index: Option<u32>,
+    baseline: Option<&ReplayReport>,
+    new: Option<&ReplayReport>,
+) -> DiffEntry {
+    match (baseline, new) {
+        (Some(b), Some(n)) => match (b.passed, n.passed) {
+            (true, true) => {
+                let fields = diff_passing_fields(b, n);
+                if fields.is_empty() {
+                    DiffEntry::Unchanged {
+                        fixture_id,
+                        cell,
+                        sample_index,
+                    }
+                } else {
+                    DiffEntry::Drift {
+                        fixture_id,
+                        fields,
+                        cell,
+                        sample_index,
+                    }
+                }
+            }
+            (true, false) => DiffEntry::Regression {
+                fixture_id,
+                new_failures: n.failures.iter().map(|f| f.kind().to_string()).collect(),
+                cell,
+                sample_index,
+            },
+            (false, true) => DiffEntry::Fixed {
+                fixture_id,
+                cell,
+                sample_index,
+            },
+            (false, false) => DiffEntry::StillFailing {
+                fixture_id,
+                new_failures: n.failures.iter().map(|f| f.kind().to_string()).collect(),
+                cell,
+                sample_index,
+            },
+        },
+        (Some(_), None) => DiffEntry::MissingFromNew {
+            fixture_id,
+            cell,
+            sample_index,
+        },
+        (None, Some(n)) => DiffEntry::NewlyAdded {
+            fixture_id,
+            passed: n.passed,
+            cell,
+            sample_index,
+        },
+        (None, None) => unreachable!("key collected from at least one side"),
+    }
+}
+
+#[cfg(test)]
+#[path = "report_test.rs"]
+mod tests;

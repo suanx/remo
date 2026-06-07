@@ -1,0 +1,23 @@
+[package]
+name = "remo-contract"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "DEPRECATED — compatibility facade for Remo runtime and server contracts; use remo-runtime-contract / remo-server-contract directly"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-server-contract = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

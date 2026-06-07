@@ -1,0 +1,5773 @@
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+#[cfg(feature = "permission")]
+use remo_ext_permission::{PermissionConfigKey, PermissionPlugin, ToolPermissionBehavior};
+use remo_runtime::AgentRuntime;
+use remo_runtime::builder::AgentRuntimeBuilder;
+#[cfg(feature = "permission")]
+use remo_runtime::context::CompactionConfigKey;
+#[cfg(feature = "permission")]
+use remo_runtime::engine::RetryConfigKey;
+use remo_runtime::registry::ToolRegistry;
+use remo_runtime::registry::memory::MapToolRegistry;
+use remo_server::app::{
+    AdminApiConfig, ConfigModuleState, ServerConfig, ServerState, SkillCatalogArgument,
+    SkillCatalogContext, SkillCatalogEntry, SkillCatalogProvider,
+};
+use remo_server::mailbox::{Mailbox, MailboxConfig};
+use remo_server::routes::build_router;
+use remo_server::services::config_runtime::{
+    ConfigRuntimeError, ConfigRuntimeManager, ManagedMcpRegistry, McpRegistryFactory,
+    ProviderExecutorFactory,
+};
+use remo_server_contract::contract::config_store::{
+    ConfigChangeEvent, ConfigChangeKind, ConfigChangeNotifier, ConfigChangeSubscriber, ConfigStore,
+};
+use remo_server_contract::contract::executor::{
+    InferenceExecutionError, InferenceRequest, LlmExecutor,
+};
+#[cfg(feature = "permission")]
+use remo_server_contract::contract::inference::ReasoningEffort;
+use remo_server_contract::contract::inference::{StopReason, StreamResult, TokenUsage};
+use remo_server_contract::contract::storage::StorageError;
+use remo_server_contract::contract::tool::{
+    Tool, ToolCallContext, ToolDescriptor, ToolError, ToolOutput, ToolResult,
+};
+use remo_server_contract::{
+    AgentSpec, BuiltinSeedSet, BuiltinSpec, McpServerSpec, ModelSpec, PreparedSkillSpecs,
+    ProviderSpec, SkillSpec, SkillSpecSink,
+};
+use remo_stores::InMemoryStore;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode};
+use serde_json::{Value, json};
+use tokio::sync::{Barrier, broadcast};
+use tower::ServiceExt;
+
+const ADMIN_TOKEN: &str = "admin-token";
+const ADMIN_AUTH_HEADER: &str = "Bearer admin-token";
+
+struct ImmediateExecutor;
+
+#[async_trait]
+impl LlmExecutor for ImmediateExecutor {
+    async fn execute(
+        &self,
+        _request: InferenceRequest,
+    ) -> Result<StreamResult, InferenceExecutionError> {
+        Ok(StreamResult {
+            content: vec![],
+            tool_calls: vec![],
+            usage: Some(TokenUsage::default()),
+            stop_reason: Some(StopReason::EndTurn),
+            has_incomplete_tool_calls: false,
+        })
+    }
+
+    fn name(&self) -> &str {
+        "immediate"
+    }
+}
+
+struct TestProviderFactory;
+
+impl ProviderExecutorFactory for TestProviderFactory {
+    fn build(&self, spec: &ProviderSpec) -> Result<Arc<dyn LlmExecutor>, ConfigRuntimeError> {
+        if spec.adapter.eq_ignore_ascii_case("stub") {
+            return Ok(Arc::new(ImmediateExecutor));
+        }
+
+        Err(ConfigRuntimeError::UnsupportedProviderAdapter(
+            spec.adapter.clone(),
+        ))
+    }
+}
+
+/// Test factory that records how many times `build` runs per provider id —
+/// used to assert that the executor cache reuses unchanged providers.
+#[derive(Default)]
+struct CountingProviderFactory {
+    builds_per_id: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+impl CountingProviderFactory {
+    fn builds_for(&self, id: &str) -> usize {
+        self.builds_per_id
+            .lock()
+            .expect("counts lock")
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl ProviderExecutorFactory for CountingProviderFactory {
+    fn build(&self, spec: &ProviderSpec) -> Result<Arc<dyn LlmExecutor>, ConfigRuntimeError> {
+        let mut map = self.builds_per_id.lock().expect("counts lock");
+        *map.entry(spec.id.clone()).or_insert(0) += 1;
+        if spec.adapter.eq_ignore_ascii_case("stub") {
+            return Ok(Arc::new(ImmediateExecutor));
+        }
+        Err(ConfigRuntimeError::UnsupportedProviderAdapter(
+            spec.adapter.clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "permission")]
+struct RecordingPoolExecutor {
+    attempts: Arc<Mutex<Vec<String>>>,
+    retryable_model: String,
+}
+
+#[cfg(feature = "permission")]
+#[async_trait]
+impl LlmExecutor for RecordingPoolExecutor {
+    async fn execute(
+        &self,
+        request: InferenceRequest,
+    ) -> Result<StreamResult, InferenceExecutionError> {
+        self.attempts
+            .lock()
+            .expect("attempt log lock poisoned")
+            .push(request.upstream_model.clone());
+
+        if request.upstream_model == self.retryable_model {
+            return Err(InferenceExecutionError::rate_limited("test retry"));
+        }
+
+        Ok(StreamResult {
+            content: vec![],
+            tool_calls: vec![],
+            usage: Some(TokenUsage::default()),
+            stop_reason: Some(StopReason::EndTurn),
+            has_incomplete_tool_calls: false,
+        })
+    }
+
+    fn name(&self) -> &str {
+        "recording-pool"
+    }
+}
+
+#[cfg(feature = "permission")]
+struct RecordingPoolProviderFactory {
+    attempts: Arc<Mutex<Vec<String>>>,
+    retryable_model: String,
+}
+
+#[cfg(feature = "permission")]
+impl ProviderExecutorFactory for RecordingPoolProviderFactory {
+    fn build(&self, spec: &ProviderSpec) -> Result<Arc<dyn LlmExecutor>, ConfigRuntimeError> {
+        if spec.adapter.eq_ignore_ascii_case("stub") {
+            return Ok(Arc::new(RecordingPoolExecutor {
+                attempts: self.attempts.clone(),
+                retryable_model: self.retryable_model.clone(),
+            }));
+        }
+
+        Err(ConfigRuntimeError::UnsupportedProviderAdapter(
+            spec.adapter.clone(),
+        ))
+    }
+}
+
+struct StaticTool {
+    id: String,
+}
+
+#[async_trait]
+impl Tool for StaticTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor::new(&self.id, &self.id, "static test tool")
+    }
+
+    async fn execute(&self, _args: Value, _ctx: &ToolCallContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolResult::success(&self.id, Value::Null).into())
+    }
+}
+
+struct TestManagedMcpRegistry {
+    tool_registry: Arc<dyn ToolRegistry>,
+    periodic_refresh_running: AtomicBool,
+}
+
+#[async_trait]
+impl ManagedMcpRegistry for TestManagedMcpRegistry {
+    fn tool_registry(&self) -> Arc<dyn ToolRegistry> {
+        Arc::clone(&self.tool_registry)
+    }
+
+    fn periodic_refresh_running(&self) -> bool {
+        self.periodic_refresh_running.load(Ordering::Relaxed)
+    }
+
+    fn start_periodic_refresh(&self, interval: Duration) -> Result<(), ConfigRuntimeError> {
+        if interval.is_zero() {
+            return Err(ConfigRuntimeError::PeriodicRefresh(
+                "interval must be non-zero".into(),
+            ));
+        }
+        self.periodic_refresh_running.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn stop_periodic_refresh(&self) -> bool {
+        self.periodic_refresh_running.swap(false, Ordering::Relaxed)
+    }
+
+    async fn server_status(
+        &self,
+        _server_name: &str,
+    ) -> Option<remo_ext_mcp::McpServerStatusSnapshot> {
+        None
+    }
+
+    async fn reconnect(&self, _server_name: &str) -> Result<(), ConfigRuntimeError> {
+        Ok(())
+    }
+}
+
+struct TestMcpRegistryFactory;
+
+#[async_trait]
+impl McpRegistryFactory for TestMcpRegistryFactory {
+    async fn connect(
+        &self,
+        specs: &[McpServerSpec],
+    ) -> Result<Option<Arc<dyn ManagedMcpRegistry>>, ConfigRuntimeError> {
+        if specs.is_empty() {
+            return Ok(None);
+        }
+
+        let mut registry = MapToolRegistry::new();
+        for spec in specs {
+            let tool_id = format!("mcp__{}__ping", spec.id);
+            registry
+                .register_tool(tool_id.clone(), Arc::new(StaticTool { id: tool_id }))
+                .expect("register synthetic mcp tool");
+        }
+
+        Ok(Some(Arc::new(TestManagedMcpRegistry {
+            tool_registry: Arc::new(registry),
+            periodic_refresh_running: AtomicBool::new(false),
+        }) as Arc<dyn ManagedMcpRegistry>))
+    }
+}
+
+#[derive(Default)]
+struct TrackingManagedMcpRegistryState {
+    periodic_refresh_running: AtomicBool,
+    start_calls: AtomicUsize,
+    stop_calls: AtomicUsize,
+    close_calls: AtomicUsize,
+    fail_close: AtomicBool,
+}
+
+struct TrackingManagedMcpRegistry {
+    tool_registry: Arc<dyn ToolRegistry>,
+    state: Arc<TrackingManagedMcpRegistryState>,
+}
+
+#[async_trait]
+impl ManagedMcpRegistry for TrackingManagedMcpRegistry {
+    fn tool_registry(&self) -> Arc<dyn ToolRegistry> {
+        Arc::clone(&self.tool_registry)
+    }
+
+    fn periodic_refresh_running(&self) -> bool {
+        self.state.periodic_refresh_running.load(Ordering::Relaxed)
+    }
+
+    fn start_periodic_refresh(&self, interval: Duration) -> Result<(), ConfigRuntimeError> {
+        if interval.is_zero() {
+            return Err(ConfigRuntimeError::PeriodicRefresh(
+                "interval must be non-zero".into(),
+            ));
+        }
+        self.state.start_calls.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .periodic_refresh_running
+            .store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn stop_periodic_refresh(&self) -> bool {
+        self.state.stop_calls.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .periodic_refresh_running
+            .swap(false, Ordering::Relaxed)
+    }
+
+    async fn close(&self) -> Result<(), ConfigRuntimeError> {
+        self.state.close_calls.fetch_add(1, Ordering::Relaxed);
+        self.stop_periodic_refresh().await;
+        if self.state.fail_close.load(Ordering::Relaxed) {
+            return Err(ConfigRuntimeError::ChangeListener(
+                "injected MCP registry close failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn server_status(
+        &self,
+        _server_name: &str,
+    ) -> Option<remo_ext_mcp::McpServerStatusSnapshot> {
+        None
+    }
+
+    async fn reconnect(&self, _server_name: &str) -> Result<(), ConfigRuntimeError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct TrackingMcpRegistryFactory {
+    states: Mutex<Vec<Arc<TrackingManagedMcpRegistryState>>>,
+}
+
+impl TrackingMcpRegistryFactory {
+    fn single_state(&self) -> Arc<TrackingManagedMcpRegistryState> {
+        self.states
+            .lock()
+            .expect("tracking factory lock poisoned")
+            .first()
+            .cloned()
+            .expect("tracking factory should have created one registry")
+    }
+
+    fn states(&self) -> Vec<Arc<TrackingManagedMcpRegistryState>> {
+        self.states
+            .lock()
+            .expect("tracking factory lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl McpRegistryFactory for TrackingMcpRegistryFactory {
+    async fn connect(
+        &self,
+        specs: &[McpServerSpec],
+    ) -> Result<Option<Arc<dyn ManagedMcpRegistry>>, ConfigRuntimeError> {
+        if specs.is_empty() {
+            return Ok(None);
+        }
+
+        let state = Arc::new(TrackingManagedMcpRegistryState::default());
+        self.states
+            .lock()
+            .expect("tracking factory lock poisoned")
+            .push(state.clone());
+
+        let mut registry = MapToolRegistry::new();
+        for spec in specs {
+            let tool_id = format!("mcp__{}__ping", spec.id);
+            registry
+                .register_tool(tool_id.clone(), Arc::new(StaticTool { id: tool_id }))
+                .expect("register synthetic mcp tool");
+        }
+
+        Ok(Some(Arc::new(TrackingManagedMcpRegistry {
+            tool_registry: Arc::new(registry),
+            state,
+        }) as Arc<dyn ManagedMcpRegistry>))
+    }
+}
+
+struct TestConfigChangeSubscriber {
+    receiver: broadcast::Receiver<ConfigChangeEvent>,
+}
+
+#[async_trait]
+impl ConfigChangeSubscriber for TestConfigChangeSubscriber {
+    async fn next(&mut self) -> Result<ConfigChangeEvent, StorageError> {
+        self.receiver.recv().await.map_err(|error| match error {
+            broadcast::error::RecvError::Closed => {
+                StorageError::Io("config change notifier closed".into())
+            }
+            broadcast::error::RecvError::Lagged(skipped) => {
+                StorageError::Io(format!("config change notifier lagged by {skipped}"))
+            }
+        })
+    }
+}
+
+struct TestConfigChangeNotifier {
+    sender: broadcast::Sender<ConfigChangeEvent>,
+}
+
+impl TestConfigChangeNotifier {
+    fn new() -> Self {
+        let (sender, _) = broadcast::channel(32);
+        Self { sender }
+    }
+
+    fn publish(&self, event: ConfigChangeEvent) {
+        let _ = self.sender.send(event);
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+}
+
+#[async_trait]
+impl ConfigChangeNotifier for TestConfigChangeNotifier {
+    async fn subscribe(&self) -> Result<Box<dyn ConfigChangeSubscriber>, StorageError> {
+        Ok(Box::new(TestConfigChangeSubscriber {
+            receiver: self.sender.subscribe(),
+        }))
+    }
+}
+
+struct PreparedTestSkillSpecs;
+
+impl PreparedSkillSpecs for PreparedTestSkillSpecs {
+    fn commit(self: Box<Self>) {}
+}
+
+struct TestSkillSpecSink;
+
+impl SkillSpecSink for TestSkillSpecSink {
+    fn prepare_skill_specs(
+        &self,
+        _specs: Vec<SkillSpec>,
+    ) -> Result<Box<dyn PreparedSkillSpecs>, String> {
+        Ok(Box::new(PreparedTestSkillSpecs))
+    }
+}
+
+struct FailingSubscribeNotifier {
+    inner: Arc<TestConfigChangeNotifier>,
+    remaining_failures: AtomicUsize,
+    subscribe_attempts: AtomicUsize,
+}
+
+impl FailingSubscribeNotifier {
+    fn new(failures: usize) -> Self {
+        Self {
+            inner: Arc::new(TestConfigChangeNotifier::new()),
+            remaining_failures: AtomicUsize::new(failures),
+            subscribe_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn publish(&self, event: ConfigChangeEvent) {
+        self.inner.publish(event);
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.inner.subscriber_count()
+    }
+
+    fn subscribe_attempts(&self) -> usize {
+        self.subscribe_attempts.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl ConfigChangeNotifier for FailingSubscribeNotifier {
+    async fn subscribe(&self) -> Result<Box<dyn ConfigChangeSubscriber>, StorageError> {
+        self.subscribe_attempts.fetch_add(1, Ordering::Relaxed);
+        let remaining = self.remaining_failures.load(Ordering::Relaxed);
+        if remaining > 0 {
+            self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
+            return Err(StorageError::Io("synthetic subscribe failure".into()));
+        }
+        self.inner.subscribe().await
+    }
+}
+
+struct FailingNextSubscriber;
+
+#[async_trait]
+impl ConfigChangeSubscriber for FailingNextSubscriber {
+    async fn next(&mut self) -> Result<ConfigChangeEvent, StorageError> {
+        Err(StorageError::Io("synthetic receive failure".into()))
+    }
+}
+
+struct RecoveringReceiveNotifier {
+    inner: Arc<TestConfigChangeNotifier>,
+    subscribe_attempts: AtomicUsize,
+}
+
+impl RecoveringReceiveNotifier {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(TestConfigChangeNotifier::new()),
+            subscribe_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn publish(&self, event: ConfigChangeEvent) {
+        self.inner.publish(event);
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.inner.subscriber_count()
+    }
+
+    fn subscribe_attempts(&self) -> usize {
+        self.subscribe_attempts.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl ConfigChangeNotifier for RecoveringReceiveNotifier {
+    async fn subscribe(&self) -> Result<Box<dyn ConfigChangeSubscriber>, StorageError> {
+        let attempt = self.subscribe_attempts.fetch_add(1, Ordering::Relaxed);
+        if attempt == 0 {
+            return Ok(Box::new(FailingNextSubscriber));
+        }
+        self.inner.subscribe().await
+    }
+}
+
+struct TestApp {
+    router: axum::Router,
+    runtime: Arc<AgentRuntime>,
+    store: Arc<InMemoryStore>,
+    manager: Arc<ConfigRuntimeManager>,
+    notifier: Arc<TestConfigChangeNotifier>,
+}
+
+struct StaticSkillCatalogProvider {
+    skills: Vec<SkillCatalogEntry>,
+}
+
+impl SkillCatalogProvider for StaticSkillCatalogProvider {
+    fn list_skills(&self) -> Vec<SkillCatalogEntry> {
+        self.skills.clone()
+    }
+}
+
+fn agent_spec(id: &str, model_id: &str) -> AgentSpec {
+    AgentSpec {
+        id: id.into(),
+        model_id: model_id.into(),
+        system_prompt: format!("agent {id}"),
+        max_rounds: 1,
+        ..Default::default()
+    }
+}
+
+async fn make_runtime_manager(
+    change_notifier: Option<Arc<dyn ConfigChangeNotifier>>,
+) -> (
+    Arc<AgentRuntime>,
+    Arc<InMemoryStore>,
+    Arc<ConfigRuntimeManager>,
+) {
+    make_runtime_manager_with_options(change_notifier, Arc::new(TestMcpRegistryFactory), None).await
+}
+
+async fn make_runtime_manager_with_options(
+    change_notifier: Option<Arc<dyn ConfigChangeNotifier>>,
+    mcp_registry_factory: Arc<dyn McpRegistryFactory>,
+    mcp_refresh_interval: Option<Duration>,
+) -> (
+    Arc<AgentRuntime>,
+    Arc<InMemoryStore>,
+    Arc<ConfigRuntimeManager>,
+) {
+    make_runtime_manager_custom(
+        change_notifier,
+        mcp_registry_factory,
+        mcp_refresh_interval,
+        Arc::new(TestProviderFactory),
+        false,
+        true,
+    )
+    .await
+}
+
+async fn make_runtime_manager_custom(
+    change_notifier: Option<Arc<dyn ConfigChangeNotifier>>,
+    mcp_registry_factory: Arc<dyn McpRegistryFactory>,
+    mcp_refresh_interval: Option<Duration>,
+    provider_factory: Arc<dyn ProviderExecutorFactory>,
+    register_permission_plugin: bool,
+    attach_skill_sink: bool,
+) -> (
+    Arc<AgentRuntime>,
+    Arc<InMemoryStore>,
+    Arc<ConfigRuntimeManager>,
+) {
+    let store = Arc::new(InMemoryStore::new());
+
+    let builder = AgentRuntimeBuilder::new()
+        .with_provider("bootstrap", Arc::new(ImmediateExecutor))
+        .with_in_memory_thread_run_store(store.clone());
+    #[cfg(feature = "permission")]
+    let builder = if register_permission_plugin {
+        builder.with_plugin("permission", Arc::new(PermissionPlugin))
+    } else {
+        builder
+    };
+    #[cfg(not(feature = "permission"))]
+    let _ = register_permission_plugin;
+
+    let runtime = Arc::new(builder.build().expect("build runtime"));
+
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+    let mut manager = ConfigRuntimeManager::new(runtime.clone(), config_store.clone())
+        .expect("config runtime manager")
+        .with_provider_factory(provider_factory)
+        .with_mcp_registry_factory(mcp_registry_factory);
+    if attach_skill_sink {
+        manager = manager.with_skill_spec_sink(Arc::new(TestSkillSpecSink));
+    }
+    if let Some(notifier) = change_notifier {
+        manager = manager.with_change_notifier(notifier);
+    }
+    if let Some(interval) = mcp_refresh_interval {
+        manager = manager.with_mcp_refresh_interval(interval);
+    }
+    let manager = Arc::new(manager);
+    let seed = BuiltinSeedSet {
+        binary_version: "test".to_string(),
+        specs: vec![
+            BuiltinSpec::provider(ProviderSpec {
+                id: "bootstrap".into(),
+                adapter: "stub".into(),
+                ..Default::default()
+            }),
+            BuiltinSpec::model(ModelSpec::new("bootstrap", "bootstrap", "bootstrap-model")),
+            BuiltinSpec::agent(agent_spec("bootstrap", "bootstrap")),
+        ],
+    };
+    manager.apply_seed(&seed).await.expect("apply_seed");
+    manager.apply().await.expect("publish config snapshot");
+
+    (runtime, store, manager)
+}
+
+async fn make_app() -> TestApp {
+    make_app_with_skill_catalog(None).await
+}
+
+async fn make_app_without_skill_sink() -> TestApp {
+    let notifier = Arc::new(TestConfigChangeNotifier::new());
+    let (runtime, store, manager) = make_runtime_manager_custom(
+        Some(notifier.clone() as Arc<dyn ConfigChangeNotifier>),
+        Arc::new(TestMcpRegistryFactory),
+        None,
+        Arc::new(TestProviderFactory),
+        false,
+        false,
+    )
+    .await;
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        store.clone(),
+        "config-api-test".into(),
+        MailboxConfig::default(),
+    ));
+    let mut state = ServerState::new(
+        runtime.clone(),
+        mailbox,
+        store.clone(),
+        runtime.resolver_arc(),
+        ServerConfig::default(),
+    );
+    state.config = Some(ConfigModuleState::new(config_store, manager.clone()));
+    state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+
+    TestApp {
+        router: build_router(&state),
+        runtime,
+        store,
+        manager,
+        notifier,
+    }
+}
+
+async fn make_app_with_skill_catalog(
+    skill_catalog_provider: Option<Arc<dyn SkillCatalogProvider>>,
+) -> TestApp {
+    make_app_with_skill_catalog_and_config(skill_catalog_provider, ServerConfig::default()).await
+}
+
+async fn make_app_with_admin_token(token: &str) -> TestApp {
+    make_app_with_skill_catalog_config_and_admin(
+        None,
+        ServerConfig::default(),
+        Some(AdminApiConfig {
+            bearer_token: Some(token.into()),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+async fn make_app_with_skill_catalog_and_config(
+    skill_catalog_provider: Option<Arc<dyn SkillCatalogProvider>>,
+    config: ServerConfig,
+) -> TestApp {
+    make_app_with_skill_catalog_config_and_admin(skill_catalog_provider, config, None).await
+}
+
+async fn make_app_with_skill_catalog_config_and_admin(
+    skill_catalog_provider: Option<Arc<dyn SkillCatalogProvider>>,
+    config: ServerConfig,
+    admin_config: Option<AdminApiConfig>,
+) -> TestApp {
+    let notifier = Arc::new(TestConfigChangeNotifier::new());
+    let (runtime, store, manager) =
+        make_runtime_manager(Some(notifier.clone() as Arc<dyn ConfigChangeNotifier>)).await;
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        store.clone(),
+        "config-api-test".into(),
+        MailboxConfig::default(),
+    ));
+    let mut state = ServerState::new(
+        runtime.clone(),
+        mailbox,
+        store.clone(),
+        runtime.resolver_arc(),
+        config,
+    );
+    state.config = Some(ConfigModuleState::new(config_store, manager.clone()));
+    if let Some(admin_config) = admin_config {
+        state.admin.admin_api_config = admin_config;
+    } else {
+        state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+    }
+    if let Some(provider) = skill_catalog_provider
+        && let Some(config) = &mut state.config
+    {
+        config.skill_catalog_provider = Some(provider);
+    }
+
+    TestApp {
+        router: build_router(&state),
+        runtime,
+        store,
+        manager,
+        notifier,
+    }
+}
+
+async fn request_json(
+    router: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    request_json_with_headers(
+        router,
+        method,
+        uri,
+        body,
+        &[("authorization", ADMIN_AUTH_HEADER)],
+    )
+    .await
+}
+
+async fn request_json_with_headers(
+    router: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = if let Some(body) = body {
+        builder = builder.header("content-type", "application/json");
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("request build")
+    } else {
+        builder.body(Body::empty()).expect("request build")
+    };
+
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router should handle request");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    if bytes.is_empty() {
+        return (status, Value::Null);
+    }
+
+    (
+        status,
+        serde_json::from_slice(&bytes).expect("response should be valid JSON"),
+    )
+}
+
+fn contains_id(items: &[Value], id: &str) -> bool {
+    items.iter().any(|item| item["id"] == id)
+}
+
+async fn wait_until(
+    timeout: Duration,
+    interval: Duration,
+    mut predicate: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        tokio::time::sleep(interval).await;
+    }
+    predicate()
+}
+
+#[tokio::test]
+async fn admin_assistant_runs_require_bearer_token_when_configured() {
+    let app = make_app_with_admin_token("admin-token").await;
+    let body = serde_json::json!({ "messages": [] });
+
+    // No token: rejected.
+    let (status, body_out) = request_json_with_headers(
+        &app.router,
+        Method::POST,
+        "/v1/admin/assistant/runs",
+        Some(body.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no token: {body_out}");
+
+    // Wrong token: rejected.
+    let (status, _) = request_json_with_headers(
+        &app.router,
+        Method::POST,
+        "/v1/admin/assistant/runs",
+        Some(body),
+        &[("authorization", "Bearer wrong-token")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_config_routes_require_bearer_token_when_configured() {
+    let app = make_app_with_admin_token("admin-token").await;
+
+    let (status, body) =
+        request_json_with_headers(&app.router, Method::GET, "/v1/capabilities", None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body["error"].as_str().unwrap().contains("authentication"));
+
+    let (status, _) = request_json_with_headers(
+        &app.router,
+        Method::GET,
+        "/v1/capabilities",
+        None,
+        &[("authorization", "Bearer wrong-token")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = request_json_with_headers(
+        &app.router,
+        Method::GET,
+        "/v1/capabilities",
+        None,
+        &[("authorization", "Bearer admin-token")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["namespaces"].is_array());
+
+    for uri in [
+        "/v1/config/diagnostics",
+        "/v1/config/providers/bootstrap/removal-preview",
+    ] {
+        let (status, body) =
+            request_json_with_headers(&app.router, Method::GET, uri, None, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "uri: {uri}, body: {body}");
+
+        let (status, body) = request_json_with_headers(
+            &app.router,
+            Method::GET,
+            uri,
+            None,
+            &[("authorization", "Bearer admin-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "uri: {uri}, body: {body}");
+    }
+}
+
+#[tokio::test]
+async fn capabilities_route_stays_mounted_when_config_crud_routes_are_hidden() {
+    let app = make_app_with_skill_catalog_config_and_admin(
+        None,
+        ServerConfig::default(),
+        Some(AdminApiConfig {
+            expose_config_routes: false,
+            bearer_token: Some(ADMIN_TOKEN.into()),
+            ..AdminApiConfig::default()
+        }),
+    )
+    .await;
+
+    let (status, body) = request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["namespaces"].is_array());
+
+    let (status, _) = request_json(&app.router, Method::GET, "/v1/config/agents", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "config CRUD must still respect expose_config_routes=false"
+    );
+}
+
+#[tokio::test]
+async fn provider_secret_is_redacted_and_preserved_on_update() {
+    let app = make_app().await;
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "secure",
+            "adapter": "stub",
+            "api_key": "top-secret"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created.get("api_key").is_none());
+    assert_eq!(created["has_api_key"], true);
+
+    let (status, fetched) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/providers/secure",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fetched.get("api_key").is_none());
+    assert_eq!(fetched["has_api_key"], true);
+
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/providers/secure",
+        Some(json!({
+            "id": "secure",
+            "adapter": "stub",
+            "base_url": "https://provider.example.test"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(updated.get("api_key").is_none());
+    assert_eq!(updated["has_api_key"], true);
+
+    let stored = ConfigStore::get(app.store.as_ref(), "providers", "secure")
+        .await
+        .expect("read raw provider")
+        .expect("provider should exist");
+    let stored = remo_server_contract::ConfigRecord::<serde_json::Value>::from_value(stored)
+        .expect("decode envelope")
+        .spec;
+    assert_eq!(stored["api_key"], "top-secret");
+    assert_eq!(stored["base_url"], "https://provider.example.test");
+}
+
+#[tokio::test]
+async fn skills_config_namespace_crud_and_schema() {
+    let app = make_app().await;
+
+    let (status, schema) =
+        request_json(&app.router, Method::GET, "/v1/config/skills/$schema", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(schema.get("$defs").is_some() || schema.get("type").is_some());
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let namespaces = capabilities["namespaces"]
+        .as_array()
+        .expect("namespaces array");
+    assert!(
+        namespaces
+            .iter()
+            .any(|namespace| namespace["namespace"] == "skills"),
+        "capabilities must advertise the skills config namespace: {capabilities}"
+    );
+
+    let body = json!({
+        "id": "db-management",
+        "name": "Database Management",
+        "description": "Helps with database operations",
+        "instructions_md": "Inspect schema before running SQL."
+    });
+    let (status, created) =
+        request_json(&app.router, Method::POST, "/v1/config/skills", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "body={created}");
+    assert_eq!(created["id"], "db-management");
+
+    let (status, fetched) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/skills/db-management",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fetched["instructions_md"],
+        "Inspect schema before running SQL."
+    );
+
+    let (status, list) = request_json(&app.router, Method::GET, "/v1/config/skills", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(contains_id(
+        list["items"].as_array().unwrap(),
+        "db-management"
+    ));
+
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/skills/db-management",
+        Some(json!({
+            "id": "db-management",
+            "name": "Database Management",
+            "description": "Updated database operations",
+            "instructions_md": "Use transactions for writes.",
+            "when_to_use": "When the user asks about a database",
+            "arguments": [{
+                "name": "dialect",
+                "description": "SQL dialect",
+                "required": true
+            }],
+            "argument_hint": "dialect=postgres",
+            "user_invocable": false,
+            "model_invocable": false,
+            "model_override": "analysis-model",
+            "context": "fork"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={updated}");
+    assert_eq!(updated["description"], "Updated database operations");
+    assert!(updated.get("allowed_tools").is_none());
+    assert!(updated.get("paths").is_none());
+    assert_eq!(updated["arguments"][0]["name"], "dialect");
+    assert_eq!(updated["context"], "fork");
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "DB",
+            "name": "Database Management",
+            "description": "Helps with database operations",
+            "instructions_md": "Inspect schema before running SQL."
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(invalid["error"].as_str().unwrap().contains("lowercase"));
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "path-skill",
+            "name": "Path Skill",
+            "description": "Should not expose unsupported resources",
+            "instructions_md": "Inspect schema before running SQL.",
+            "paths": ["migrations/**"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap()
+            .contains("paths are not supported")
+    );
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "scoped-tool-skill",
+            "name": "Scoped Tool Skill",
+            "description": "Should not accept scoped tool grants yet",
+            "instructions_md": "Use a scoped tool.",
+            "allowed_tools": ["Bash(command: \"git status\")"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap()
+            .contains("scoped allowed_tools entry")
+    );
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "invalid-regex-skill",
+            "name": "Invalid Regex Skill",
+            "description": "Should reject invalid regex matchers",
+            "instructions_md": "Use a matcher.",
+            "allowed_tools": ["/[invalid/"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid allowed-tools pattern")
+    );
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "invalid-glob-skill",
+            "name": "Invalid Glob Skill",
+            "description": "Should reject invalid glob matchers",
+            "instructions_md": "Use a matcher.",
+            "allowed_tools": [r"mcp__db__*\"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap()
+            .contains("dangling escape")
+    );
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "spaced-argument-skill",
+            "name": "Spaced Argument Skill",
+            "description": "Should reject ambiguous argument names",
+            "instructions_md": "Use ${dialect}.",
+            "arguments": [{"name": " dialect "}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap()
+            .contains("surrounding whitespace")
+    );
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "ghost-tool-skill",
+            "name": "Ghost Tool Skill",
+            "description": "References an unknown tool",
+            "instructions_md": "Use a tool.",
+            "allowed_tools": ["ghost_tool"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool 'ghost_tool'")
+    );
+    let (status, _) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/skills/ghost-tool-skill",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, deleted) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/skills/db-management",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body={deleted}");
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/skills/db-management",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn skills_config_create_fails_without_skill_sink_and_rolls_back() {
+    let app = make_app_without_skill_sink().await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "db-management",
+            "name": "Database Management",
+            "description": "Helps with database operations",
+            "instructions_md": "Inspect schema before running SQL."
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("skill_spec_sink"),
+        "unexpected body: {body}"
+    );
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/skills/db-management",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn config_apply_failure_rolls_back_create_and_update_without_runtime_swap() {
+    let app = make_app().await;
+    let before_snapshot = app.runtime.registry_snapshot().expect("registry snapshot");
+    let before_version = before_snapshot.version();
+    let before_agents = before_snapshot.registries().agents.agent_ids();
+    drop(before_snapshot);
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "bad-provider-create",
+            "adapter": "unsupported-provider",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported provider adapter"),
+        "unexpected error body: {body}"
+    );
+    assert!(
+        ConfigStore::get(app.store.as_ref(), "providers", "bad-provider-create")
+            .await
+            .expect("read rolled-back provider")
+            .is_none(),
+        "failed create apply must remove the staged provider record"
+    );
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "provider-rollback",
+            "adapter": "stub",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={created}");
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/providers/provider-rollback",
+        Some(json!({
+            "id": "provider-rollback",
+            "adapter": "unsupported-provider",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported provider adapter"),
+        "unexpected error body: {body}"
+    );
+
+    let (status, restored) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/providers/provider-rollback",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={restored}");
+    assert_eq!(
+        restored["adapter"],
+        json!("stub"),
+        "failed update apply must restore the previous provider record"
+    );
+
+    let after_snapshot = app.runtime.registry_snapshot().expect("registry snapshot");
+    assert!(
+        after_snapshot.version() >= before_version,
+        "successful intermediate create may advance the version"
+    );
+    assert_eq!(
+        before_agents,
+        after_snapshot.registries().agents.agent_ids(),
+        "failed provider applies must not swap the live agent registry"
+    );
+    assert!(
+        app.runtime.resolver().resolve("bootstrap").is_ok(),
+        "bootstrap agent must remain resolvable after failed applies"
+    );
+}
+
+#[tokio::test]
+async fn provider_service_account_shaped_secret_is_never_returned_by_admin_api() {
+    let app = make_app().await;
+    let service_account_json = r#"{
+        "client_email":"sa@project.iam.gserviceaccount.com",
+        "private_key":"-----BEGIN PRIVATE KEY-----\nsa-private-material\n-----END PRIVATE KEY-----",
+        "token_uri":"https://oauth2.googleapis.com/token"
+    }"#;
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "sa-shaped",
+            "adapter": "stub",
+            "api_key": service_account_json
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, fetched) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/providers/sa-shaped",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, listed) =
+        request_json(&app.router, Method::GET, "/v1/config/providers", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for payload in [created, fetched, listed] {
+        let rendered = payload.to_string();
+        for secret in [
+            "sa-private-material",
+            "BEGIN PRIVATE KEY",
+            "sa@project.iam.gserviceaccount.com",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "admin API response leaked provider secret fragment {secret:?}: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("has_api_key"),
+            "response should expose only a boolean/key-presence marker: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_servers_are_redacted_and_publish_live_tools() {
+    let app = make_app().await;
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/mcp-servers",
+        Some(json!({
+            "id": "demo",
+            "transport": "stdio",
+            "command": "demo-mcp",
+            "args": ["--serve"],
+            "env": {
+                "TOKEN": "secret-token"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created.get("env").is_none());
+    assert_eq!(created["has_env"], true);
+    assert_eq!(created["env_keys"], json!(["TOKEN"]));
+
+    let (status, fetched) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/mcp-servers/demo",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fetched.get("env").is_none());
+    assert_eq!(fetched["has_env"], true);
+    assert_eq!(fetched["env_keys"], json!(["TOKEN"]));
+
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/mcp-servers/demo",
+        Some(json!({
+            "id": "demo",
+            "transport": "stdio",
+            "command": "demo-mcp",
+            "args": ["--updated"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(updated.get("env").is_none());
+    assert_eq!(updated["has_env"], true);
+
+    let stored = ConfigStore::get(app.store.as_ref(), "mcp-servers", "demo")
+        .await
+        .expect("read raw mcp config")
+        .expect("mcp config should exist");
+    let stored = remo_server_contract::ConfigRecord::<serde_json::Value>::from_value(stored)
+        .expect("decode envelope")
+        .spec;
+    assert_eq!(stored["env"]["TOKEN"], "secret-token");
+    assert_eq!(stored["args"], json!(["--updated"]));
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let tools = capabilities["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(contains_id(tools, "mcp__demo__ping"));
+
+    let resolved = app
+        .runtime
+        .resolver()
+        .resolve("bootstrap")
+        .expect("bootstrap agent should resolve");
+    assert!(
+        resolved.tools.contains_key("mcp__demo__ping"),
+        "resolved agent should include dynamically published MCP tools"
+    );
+}
+
+#[tokio::test]
+async fn a2a_servers_redact_preserve_clear_auth_and_validate_url() {
+    let app = make_app().await;
+
+    let (status, invalid) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/a2a-servers",
+        Some(json!({
+            "id": "invalid",
+            "base_url": "not a url",
+            "timeout_ms": 50
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid.to_string().contains("base_url"),
+        "validation error should explain the invalid URL: {invalid}"
+    );
+
+    let (status, invalid_timeout) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/a2a-servers",
+        Some(json!({
+            "id": "invalid-timeout",
+            "base_url": "https://partner.example.com",
+            "timeout_ms": 30_001
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_timeout.to_string().contains("timeout_ms"),
+        "validation error should explain the timeout limit: {invalid_timeout}"
+    );
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/a2a-servers",
+        Some(json!({
+            "id": "partner",
+            "base_url": "http://127.0.0.1:9",
+            "timeout_ms": 50,
+            "auth": {
+                "type": "bearer",
+                "token": "a2a-secret-token"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created.get("auth").is_none());
+    assert_eq!(created["has_auth"], true);
+
+    let (status, fetched) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/a2a-servers/partner",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fetched.get("auth").is_none());
+    assert_eq!(fetched["has_auth"], true);
+
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/a2a-servers/partner",
+        Some(json!({
+            "id": "partner",
+            "base_url": "http://127.0.0.1:9/a2a",
+            "timeout_ms": 75,
+            "has_auth": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(updated.get("auth").is_none());
+    assert_eq!(updated["has_auth"], true);
+
+    let stored = ConfigStore::get(app.store.as_ref(), "a2a-servers", "partner")
+        .await
+        .expect("read raw a2a server config")
+        .expect("a2a server config should exist");
+    let stored = remo_server_contract::ConfigRecord::<serde_json::Value>::from_value(stored)
+        .expect("decode envelope")
+        .spec;
+    assert_eq!(stored["auth"]["token"], "a2a-secret-token");
+    assert_eq!(stored["base_url"], "http://127.0.0.1:9/a2a");
+
+    let (status, cleared) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/a2a-servers/partner",
+        Some(json!({
+            "id": "partner",
+            "base_url": "http://127.0.0.1:9",
+            "timeout_ms": 50,
+            "auth": null
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(cleared.get("auth").is_none());
+    assert!(cleared.get("has_auth").is_none());
+
+    let stored = ConfigStore::get(app.store.as_ref(), "a2a-servers", "partner")
+        .await
+        .expect("read raw a2a server config")
+        .expect("a2a server config should exist");
+    let stored = remo_server_contract::ConfigRecord::<serde_json::Value>::from_value(stored)
+        .expect("decode envelope")
+        .spec;
+    assert!(stored.get("auth").map(Value::is_null).unwrap_or(true));
+}
+
+#[tokio::test]
+async fn a2a_status_rejects_private_hosts_without_500() {
+    let app = make_app().await;
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/a2a-servers",
+        Some(json!({
+            "id": "status-private",
+            "base_url": "http://127.0.0.1:9",
+            "timeout_ms": 50
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {created}");
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/a2a-servers/status-private/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["connected"], false);
+    assert!(
+        body["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("non-public"),
+        "private host should be reported as an unavailable remote, not a backend error: {body}"
+    );
+}
+
+#[tokio::test]
+async fn delete_mcp_server_is_blocked_when_skill_references_its_tool() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/mcp-servers",
+        Some(json!({
+            "id": "demo",
+            "transport": "stdio",
+            "command": "demo-mcp"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created_skill) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "mcp-skill",
+            "name": "MCP Skill",
+            "description": "Uses an MCP tool",
+            "instructions_md": "Call the MCP tool.",
+            "allowed_tools": ["mcp__demo__ping"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={created_skill}");
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/mcp-servers/demo",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let used_by = body["used_by"].as_array().expect("used_by array");
+    assert!(
+        used_by
+            .iter()
+            .any(|record| record["namespace"] == "skills" && record["id"] == "mcp-skill"),
+        "should report skill dependency: {body}"
+    );
+}
+
+#[tokio::test]
+async fn delete_mcp_server_is_blocked_when_skill_pattern_matches_current_tool() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/mcp-servers",
+        Some(json!({
+            "id": "demo",
+            "transport": "stdio",
+            "command": "demo-mcp"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created_skill) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/skills",
+        Some(json!({
+            "id": "mcp-pattern-skill",
+            "name": "MCP Pattern Skill",
+            "description": "Uses matching MCP tools",
+            "instructions_md": "Call the MCP tool.",
+            "allowed_tools": ["mcp__*__ping"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={created_skill}");
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/mcp-servers/demo",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let used_by = body["used_by"].as_array().expect("used_by array");
+    assert!(
+        used_by
+            .iter()
+            .any(|record| record["namespace"] == "skills" && record["id"] == "mcp-pattern-skill"),
+        "should report skill pattern dependency: {body}"
+    );
+}
+
+#[tokio::test]
+async fn published_config_updates_live_capabilities_and_resolver() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "provider-1",
+            "adapter": "stub",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": "model-1",
+            "provider_id": "provider-1",
+            "upstream_model": "test-model"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, agent) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "agent-1",
+            "model_id": "model-1",
+            "system_prompt": "hello",
+            "max_rounds": 2
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(agent["id"], "agent-1");
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let agents = capabilities["agents"]
+        .as_array()
+        .expect("agents should be an array");
+    assert!(agents.iter().any(|value| value == "agent-1"));
+
+    let models = capabilities["models"]
+        .as_array()
+        .expect("models should be an array");
+    assert!(contains_id(models, "model-1"));
+
+    let providers = capabilities["providers"]
+        .as_array()
+        .expect("providers should be an array");
+    assert!(contains_id(providers, "provider-1"));
+
+    let resolved = app
+        .runtime
+        .resolver()
+        .resolve("agent-1")
+        .expect("resolver should see published config");
+    assert_eq!(resolved.id(), "agent-1");
+    assert_eq!(resolved.model_id(), "model-1");
+}
+
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn documented_config_driven_agent_tuning_publishes_sections_and_retry() {
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let notifier = Arc::new(TestConfigChangeNotifier::new());
+    let (runtime, store, manager) = make_runtime_manager_custom(
+        Some(notifier.clone() as Arc<dyn ConfigChangeNotifier>),
+        Arc::new(TestMcpRegistryFactory),
+        None,
+        Arc::new(RecordingPoolProviderFactory {
+            attempts: attempts.clone(),
+            retryable_model: "doc-primary".into(),
+        }),
+        true,
+        true,
+    )
+    .await;
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        store.clone(),
+        "config-doc-scenario-test".into(),
+        MailboxConfig::default(),
+    ));
+    let mut state = ServerState::new(
+        runtime.clone(),
+        mailbox,
+        store,
+        runtime.resolver_arc(),
+        ServerConfig::default(),
+    );
+    state.config = Some(ConfigModuleState::new(config_store, manager));
+    state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+    let router = build_router(&state);
+
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "doc-provider",
+            "adapter": "stub",
+            "api_key": "test-key",
+            "base_url": null,
+            "timeout_secs": 300
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": "research-primary",
+            "provider_id": "doc-provider",
+            "upstream_model": "doc-primary"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": "research-backup",
+            "provider_id": "doc-provider",
+            "upstream_model": "doc-backup"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/model-pools",
+        Some(json!({
+            "id": "research-default",
+            "members": [
+                { "model_id": "research-primary" },
+                { "model_id": "research-backup", "role": "failover_only" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+
+    let (status, agent) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "research-assistant",
+            "model_id": "research-default",
+            "system_prompt": "You help with source-grounded research.",
+            "max_rounds": 12,
+            "max_continuation_retries": 3,
+            "reasoning_effort": "medium",
+            "plugin_ids": ["permission"],
+            "allowed_tools": ["read_document", "web_search", "summarize"],
+            "excluded_tools": ["delete_file"],
+            "context_policy": {
+                "max_context_tokens": 120000,
+                "max_output_tokens": 8192,
+                "min_recent_messages": 8,
+                "enable_prompt_cache": true,
+                "autocompact_threshold": 90000,
+                "compaction_mode": "keep_recent_raw_suffix",
+                "compaction_raw_suffix_messages": 2
+            },
+            "sections": {
+                "retry": {
+                    "max_retries": 1,
+                    "backoff_base_ms": 0
+                },
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "read_document", "behavior": "allow" },
+                        { "tool": "web_search", "behavior": "ask" },
+                        { "tool": "delete_*", "behavior": "deny" }
+                    ]
+                },
+                "compaction": {
+                    "summarizer_system_prompt": "Preserve decisions, facts, tool results, and unresolved tasks.",
+                    "summarizer_user_prompt": "Summarize the following conversation:\n\n{messages}",
+                    "summary_max_tokens": 1024,
+                    "summary_model": "doc-summary",
+                    "min_savings_ratio": 0.3
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(agent["id"], "research-assistant");
+
+    let (status, capabilities) = request_json(&router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let permission_plugin = capabilities["plugins"]
+        .as_array()
+        .expect("plugins should be an array")
+        .iter()
+        .find(|plugin| plugin["id"] == "permission")
+        .expect("permission plugin should be advertised");
+    assert!(
+        permission_plugin["config_schemas"]
+            .as_array()
+            .expect("config_schemas should be an array")
+            .iter()
+            .any(|schema| schema["key"] == "permission")
+    );
+    let permission_schema = permission_plugin["config_schemas"]
+        .as_array()
+        .expect("config_schemas should be an array")
+        .iter()
+        .find(|schema| schema["key"] == "permission")
+        .expect("permission schema should be advertised");
+    assert_eq!(permission_schema["display_name"], "Permissions");
+    assert_eq!(permission_schema["category"], "safety");
+    assert_eq!(permission_schema["editor"], "permission");
+    assert_eq!(
+        permission_schema["default_value"],
+        json!({ "default_behavior": "ask", "rules": [] })
+    );
+
+    let resolved = runtime
+        .resolver()
+        .resolve("research-assistant")
+        .expect("documented config-driven agent should resolve");
+    assert_eq!(resolved.id(), "research-assistant");
+    assert_eq!(resolved.model_id(), "research-default");
+    assert_eq!(resolved.upstream_model, "research-default");
+    assert_eq!(resolved.max_rounds(), 12);
+    assert_eq!(resolved.max_continuation_retries(), 3);
+    assert_eq!(
+        resolved.spec.reasoning_effort.as_ref(),
+        Some(&ReasoningEffort::Medium)
+    );
+    assert_eq!(
+        resolved.spec.allowed_tools.as_ref().expect("allowed tools"),
+        &vec![
+            "read_document".to_string(),
+            "web_search".to_string(),
+            "summarize".to_string()
+        ]
+    );
+    assert_eq!(
+        resolved
+            .spec
+            .excluded_tools
+            .as_ref()
+            .expect("excluded tools"),
+        &vec!["delete_file".to_string()]
+    );
+
+    let retry = resolved
+        .spec
+        .config::<RetryConfigKey>()
+        .expect("retry section should decode");
+    assert_eq!(retry.max_retries, 1);
+    assert_eq!(retry.backoff_base_ms, 0);
+
+    let permission = resolved
+        .spec
+        .config::<PermissionConfigKey>()
+        .expect("permission section should decode");
+    assert_eq!(permission.default_behavior, ToolPermissionBehavior::Ask);
+    assert_eq!(permission.rules.len(), 3);
+    assert_eq!(permission.rules[0].tool, "read_document");
+
+    let context_policy = resolved
+        .context_policy()
+        .expect("context policy should be configured");
+    assert_eq!(context_policy.max_context_tokens, 120000);
+    assert_eq!(context_policy.autocompact_threshold, Some(90000));
+
+    let compaction = resolved
+        .spec
+        .config::<CompactionConfigKey>()
+        .expect("compaction section should decode");
+    assert_eq!(compaction.summary_max_tokens, Some(1024));
+    assert_eq!(compaction.summary_model.as_deref(), Some("doc-summary"));
+    assert!((compaction.min_savings_ratio - 0.3).abs() < f64::EPSILON);
+
+    attempts.lock().expect("attempt log lock poisoned").clear();
+    resolved
+        .llm_executor
+        .execute(InferenceRequest {
+            upstream_model: resolved.upstream_model.clone(),
+            routing_key: None,
+            messages: vec![],
+            tools: vec![],
+            system: vec![],
+            overrides: None,
+            enable_prompt_cache: context_policy.enable_prompt_cache,
+        })
+        .await
+        .expect("model pool should recover retryable primary failure");
+    assert_eq!(
+        *attempts.lock().expect("attempt log lock poisoned"),
+        vec![
+            "doc-primary".to_string(),
+            "doc-primary".to_string(),
+            "doc-backup".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn capabilities_include_skill_registry_when_available() {
+    let skill_catalog = Arc::new(StaticSkillCatalogProvider {
+        skills: vec![SkillCatalogEntry {
+            id: "greeting".into(),
+            name: "Greeting".into(),
+            description: "Adds friendly greeting behavior".into(),
+            allowed_tools: vec!["append_note".into()],
+            when_to_use: Some("When the user needs a warm opening.".into()),
+            arguments: vec![SkillCatalogArgument {
+                name: "tone".into(),
+                description: Some("Greeting tone".into()),
+                required: false,
+            }],
+            argument_hint: Some("tone=warm".into()),
+            user_invocable: true,
+            model_invocable: true,
+            model_override: None,
+            context: SkillCatalogContext::Inline,
+            paths: vec!["src/**".into()],
+        }],
+    }) as Arc<dyn SkillCatalogProvider>;
+    let app = make_app_with_skill_catalog(Some(skill_catalog)).await;
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let skills = capabilities["skills"]
+        .as_array()
+        .expect("skills should be an array");
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["id"], "greeting");
+    assert_eq!(skills[0]["name"], "Greeting");
+    assert_eq!(skills[0]["context"], "inline");
+    assert_eq!(skills[0]["allowed_tools"], json!(["append_note"]));
+    assert_eq!(skills[0]["arguments"][0]["name"], "tone");
+}
+
+#[tokio::test]
+async fn capabilities_report_runtime_supported_adapters_without_scripted() {
+    let app = make_app().await;
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let adapters = capabilities["supported_adapters"]
+        .as_array()
+        .expect("supported_adapters should be an array");
+    assert!(adapters.iter().any(|value| value == "openai"));
+    assert!(adapters.iter().any(|value| value == "groq"));
+    assert!(adapters.iter().any(|value| value == "nebius"));
+    assert!(
+        !adapters.iter().any(|value| value == "scripted"),
+        "admin capabilities must not advertise adapters the runtime rejects"
+    );
+}
+
+#[tokio::test]
+async fn capabilities_expose_backend_config_schemas_for_frontend_rendering() {
+    let app = make_app().await;
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let backends = capabilities["backends"]
+        .as_array()
+        .expect("backends should be an array");
+    let remo = backends
+        .iter()
+        .find(|backend| backend["kind"] == "remo")
+        .expect("remo backend schema should be advertised");
+    assert_eq!(remo["version"], json!(1));
+    assert_eq!(
+        remo["schema"]["properties"]["model_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(remo["default_config"]["max_rounds"], json!(10));
+
+    let a2a = backends
+        .iter()
+        .find(|backend| backend["kind"] == "a2a")
+        .expect("a2a backend schema should be advertised");
+    assert_eq!(a2a["version"], json!(1));
+    assert_eq!(a2a["schema"]["required"], json!(["base_url"]));
+    assert_eq!(
+        a2a["schema"]["properties"]["auth"]["anyOf"][1]["properties"]["type"]["const"],
+        json!("bearer")
+    );
+    assert_eq!(a2a["default_config"]["timeout_ms"], json!(300_000));
+}
+
+#[tokio::test]
+async fn capabilities_expose_admin_assistant_without_registry_tools() {
+    let app = make_app().await;
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let assistant = &capabilities["admin_assistant"];
+    assert_eq!(assistant["id"], "__admin_assistant");
+    assert_eq!(assistant["enabled"], true);
+    assert_eq!(assistant["visibility"], "admin_only");
+    assert_eq!(assistant["tools_locked"], true);
+    assert_eq!(assistant["endpoint"], "/v1/admin/assistant/runs");
+
+    let bound_tools = assistant["bound_tools"]
+        .as_array()
+        .expect("admin assistant bound tools should be listed");
+    assert!(contains_id(bound_tools, "admin_get_platform_capabilities"));
+    assert!(contains_id(bound_tools, "admin_create_agent_draft"));
+    assert!(contains_id(bound_tools, "admin_validate_agent"));
+    assert!(
+        bound_tools
+            .iter()
+            .all(|tool| tool["selectable_by_agents"] == false),
+        "admin assistant tools must not be assignable to user agents: {bound_tools:?}"
+    );
+
+    let registry_tools = capabilities["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(!contains_id(
+        registry_tools,
+        "admin_get_platform_capabilities"
+    ));
+    assert!(!contains_id(registry_tools, "admin_create_agent"));
+    assert!(!contains_id(registry_tools, "admin_create_agent_draft"));
+    assert!(!contains_id(registry_tools, "admin_validate_agent"));
+}
+
+#[tokio::test]
+async fn admin_assistant_config_is_admin_only_and_persisted() {
+    let app = make_app().await;
+
+    let (status, _) = request_json_with_headers(
+        &app.router,
+        Method::GET,
+        "/v1/admin/assistant/config",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, config) =
+        request_json(&app.router, Method::GET, "/v1/admin/assistant/config", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["id"], "default");
+    assert_eq!(config["policy_prompt"], "");
+
+    let (status, created_model) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": "assistant-model",
+            "provider_id": "bootstrap",
+            "upstream_model": "assistant-upstream"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {created_model}");
+
+    let body = json!({
+        "id": "ignored",
+        "policy_prompt": "Prefer compact, production-ready agent drafts.",
+        "model_id": "assistant-model"
+    });
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/admin/assistant/config",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {updated}");
+    assert_eq!(updated["id"], "default");
+    assert_eq!(
+        updated["policy_prompt"],
+        "Prefer compact, production-ready agent drafts."
+    );
+    assert_eq!(updated["model_id"], "assistant-model");
+
+    let (status, loaded) =
+        request_json(&app.router, Method::GET, "/v1/admin/assistant/config", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(loaded, updated);
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        capabilities["admin_assistant"]["model_id"],
+        "assistant-model"
+    );
+}
+
+#[tokio::test]
+async fn admin_assistant_config_rejects_invalid_model_and_stale_revision() {
+    let app = make_app().await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/admin/assistant/config",
+        Some(json!({
+            "id": "default",
+            "policy_prompt": "",
+            "model_id": "missing-model",
+            "revision": 0
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    let (status, current) =
+        request_json(&app.router, Method::GET, "/v1/admin/assistant/config", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let first = json!({
+        "id": "default",
+        "policy_prompt": "Prefer concise drafts.",
+        "model_id": null,
+        "revision": current["revision"]
+    });
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/admin/assistant/config",
+        Some(first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {updated}");
+
+    let (status, conflict) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/admin/assistant/config",
+        Some(json!({
+            "id": "default",
+            "policy_prompt": "stale",
+            "model_id": null,
+            "revision": current["revision"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {conflict}");
+}
+
+#[tokio::test]
+async fn admin_assistant_config_rejects_oversized_policy_prompt() {
+    let app = make_app().await;
+    let prompt = "x".repeat(8 * 1024 + 1);
+    let (status, body) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/admin/assistant/config",
+        Some(json!({
+            "id": "default",
+            "policy_prompt": prompt,
+            "model_id": null,
+            "revision": 0
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
+async fn periodic_refresh_publishes_external_store_changes() {
+    let app = make_app().await;
+    app.manager
+        .start_periodic_refresh(Duration::from_millis(20))
+        .expect("start periodic refresh");
+
+    ConfigStore::put(
+        app.store.as_ref(),
+        "mcp-servers",
+        "shared",
+        &json!({
+            "id": "shared",
+            "transport": "stdio",
+            "command": "shared-mcp"
+        }),
+    )
+    .await
+    .expect("write shared mcp config");
+
+    let observed = wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
+        app.runtime
+            .resolver()
+            .resolve("bootstrap")
+            .map(|resolved| resolved.tools.contains_key("mcp__shared__ping"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        observed,
+        "runtime should converge to external config changes"
+    );
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let tools = capabilities["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(contains_id(tools, "mcp__shared__ping"));
+
+    assert!(app.manager.stop_periodic_refresh().await);
+}
+
+#[tokio::test]
+async fn notify_listener_applies_external_store_changes_without_waiting_for_poll() {
+    let app = make_app().await;
+    app.manager
+        .start_periodic_refresh(Duration::from_secs(60))
+        .expect("start periodic refresh with listener");
+    let listening = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        app.notifier.subscriber_count() > 0
+    })
+    .await;
+    assert!(
+        listening,
+        "config change listener should subscribe before publishing"
+    );
+
+    ConfigStore::put(
+        app.store.as_ref(),
+        "mcp-servers",
+        "notified",
+        &json!({
+            "id": "notified",
+            "transport": "stdio",
+            "command": "notify-mcp"
+        }),
+    )
+    .await
+    .expect("write notified mcp config");
+    app.notifier.publish(ConfigChangeEvent {
+        namespace: "mcp-servers".into(),
+        id: "notified".into(),
+        kind: ConfigChangeKind::Put,
+    });
+
+    let observed = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        app.runtime
+            .resolver()
+            .resolve("bootstrap")
+            .map(|resolved| resolved.tools.contains_key("mcp__notified__ping"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        observed,
+        "notify listener should publish config changes without waiting for the poll interval"
+    );
+
+    assert!(app.manager.stop_periodic_refresh().await);
+}
+
+#[tokio::test]
+async fn notify_listener_removes_external_store_changes_without_waiting_for_poll() {
+    let app = make_app().await;
+    app.manager
+        .start_periodic_refresh(Duration::from_secs(60))
+        .expect("start periodic refresh with listener");
+    let listening = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        app.notifier.subscriber_count() > 0
+    })
+    .await;
+    assert!(
+        listening,
+        "config change listener should subscribe before publishing"
+    );
+
+    ConfigStore::put(
+        app.store.as_ref(),
+        "mcp-servers",
+        "notify-delete",
+        &json!({
+            "id": "notify-delete",
+            "transport": "stdio",
+            "command": "notify-delete-mcp"
+        }),
+    )
+    .await
+    .expect("write mcp config before delete");
+    app.notifier.publish(ConfigChangeEvent {
+        namespace: "mcp-servers".into(),
+        id: "notify-delete".into(),
+        kind: ConfigChangeKind::Put,
+    });
+    let published = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        app.runtime
+            .resolver()
+            .resolve("bootstrap")
+            .map(|resolved| resolved.tools.contains_key("mcp__notify-delete__ping"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        published,
+        "notify listener should publish the initial MCP tool"
+    );
+
+    ConfigStore::delete(app.store.as_ref(), "mcp-servers", "notify-delete")
+        .await
+        .expect("delete mcp config");
+    app.notifier.publish(ConfigChangeEvent {
+        namespace: "mcp-servers".into(),
+        id: "notify-delete".into(),
+        kind: ConfigChangeKind::Delete,
+    });
+
+    let removed = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        app.runtime
+            .resolver()
+            .resolve("bootstrap")
+            .map(|resolved| !resolved.tools.contains_key("mcp__notify-delete__ping"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        removed,
+        "notify listener should remove published tools without waiting for the poll interval"
+    );
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let tools = capabilities["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(!contains_id(tools, "mcp__notify-delete__ping"));
+
+    assert!(app.manager.stop_periodic_refresh().await);
+}
+
+#[tokio::test]
+async fn notify_listener_recovers_from_subscribe_failures() {
+    let notifier = Arc::new(FailingSubscribeNotifier::new(1));
+    let (runtime, store, manager) =
+        make_runtime_manager(Some(notifier.clone() as Arc<dyn ConfigChangeNotifier>)).await;
+    manager
+        .start_periodic_refresh(Duration::from_secs(60))
+        .expect("start periodic refresh with listener");
+
+    let listening = wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
+        notifier.subscribe_attempts() >= 2 && notifier.subscriber_count() > 0
+    })
+    .await;
+    assert!(
+        listening,
+        "config change listener should retry subscribe failures and recover"
+    );
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "subscribe-retry",
+        &json!({
+            "id": "subscribe-retry",
+            "transport": "stdio",
+            "command": "subscribe-retry-mcp"
+        }),
+    )
+    .await
+    .expect("write mcp config after subscribe retry");
+    notifier.publish(ConfigChangeEvent {
+        namespace: "mcp-servers".into(),
+        id: "subscribe-retry".into(),
+        kind: ConfigChangeKind::Put,
+    });
+
+    let observed = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        runtime
+            .resolver()
+            .resolve("bootstrap")
+            .map(|resolved| resolved.tools.contains_key("mcp__subscribe-retry__ping"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        observed,
+        "notify listener should apply config changes after recovering from subscribe failures"
+    );
+
+    assert!(manager.stop_periodic_refresh().await);
+}
+
+#[tokio::test]
+async fn notify_listener_recovers_from_receive_failures() {
+    let notifier = Arc::new(RecoveringReceiveNotifier::new());
+    let (runtime, store, manager) =
+        make_runtime_manager(Some(notifier.clone() as Arc<dyn ConfigChangeNotifier>)).await;
+    manager
+        .start_periodic_refresh(Duration::from_secs(60))
+        .expect("start periodic refresh with listener");
+
+    let listening = wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
+        notifier.subscribe_attempts() >= 2 && notifier.subscriber_count() > 0
+    })
+    .await;
+    assert!(
+        listening,
+        "config change listener should resubscribe after receive failures"
+    );
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "receive-retry",
+        &json!({
+            "id": "receive-retry",
+            "transport": "stdio",
+            "command": "receive-retry-mcp"
+        }),
+    )
+    .await
+    .expect("write mcp config after receive retry");
+    notifier.publish(ConfigChangeEvent {
+        namespace: "mcp-servers".into(),
+        id: "receive-retry".into(),
+        kind: ConfigChangeKind::Put,
+    });
+
+    let observed = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        runtime
+            .resolver()
+            .resolve("bootstrap")
+            .map(|resolved| resolved.tools.contains_key("mcp__receive-retry__ping"))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        observed,
+        "notify listener should apply config changes after recovering from receive failures"
+    );
+
+    assert!(manager.stop_periodic_refresh().await);
+}
+
+#[tokio::test]
+async fn put_rejects_path_and_body_id_mismatch() {
+    let app = make_app().await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/agents/left",
+        Some(json!({
+            "id": "right",
+            "model_id": "bootstrap",
+            "system_prompt": "mismatch"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error string")
+            .contains("path id 'left' does not match body id 'right'")
+    );
+}
+
+#[tokio::test]
+async fn delete_provider_with_dependents_returns_409() {
+    let app = make_app().await;
+
+    // bootstrap provider is referenced by bootstrap model — should be blocked
+    let (status, body) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/providers/bootstrap",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    let used_by = body["used_by"].as_array().expect("used_by array");
+    assert!(!used_by.is_empty(), "should report dependent models");
+}
+
+#[tokio::test]
+async fn force_delete_provider_blocks_when_agent_uses_provider_model() {
+    let app = make_app().await;
+
+    // force=true may cascade unused model bindings, but it must not remove a
+    // provider when an agent still uses one of those model bindings.
+    let (status, body) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/providers/bootstrap?force=true",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    let used_by = body["used_by"].as_array().expect("used_by array");
+    assert!(
+        used_by
+            .iter()
+            .any(|record| record["namespace"] == "agents" && record["id"] == "bootstrap"),
+        "should report the agent that keeps the provider model in use: {body}"
+    );
+
+    let stored = ConfigStore::get(app.store.as_ref(), "providers", "bootstrap")
+        .await
+        .expect("read provider after blocked delete");
+    assert!(
+        stored.is_some(),
+        "provider should remain after blocked delete"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_create_returns_conflict_status() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "dupe",
+            "adapter": "stub",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": "dupe",
+            "adapter": "stub",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error string")
+            .contains("already exists")
+    );
+}
+
+#[tokio::test]
+async fn failed_publish_closes_prepared_mcp_registry() {
+    let factory = Arc::new(TrackingMcpRegistryFactory::default());
+    let (runtime, store, manager) = make_runtime_manager_with_options(
+        None,
+        factory.clone() as Arc<dyn McpRegistryFactory>,
+        Some(Duration::from_secs(5)),
+    )
+    .await;
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "cleanup",
+        &json!({
+            "id": "cleanup",
+            "transport": "stdio",
+            "command": "cleanup-mcp"
+        }),
+    )
+    .await
+    .expect("write managed mcp server");
+    ConfigStore::put(
+        store.as_ref(),
+        "providers",
+        "broken",
+        &json!({
+            "id": "broken",
+            "adapter": "unsupported-provider"
+        }),
+    )
+    .await
+    .expect("write invalid provider");
+
+    let error = manager.apply().await.expect_err("publish should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported provider adapter: unsupported-provider")
+    );
+
+    let state = factory.single_state();
+    assert_eq!(state.start_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.close_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.stop_calls.load(Ordering::Relaxed), 1);
+    assert!(!state.periodic_refresh_running.load(Ordering::Relaxed));
+
+    let resolved = runtime
+        .resolver()
+        .resolve("bootstrap")
+        .expect("bootstrap agent should still resolve");
+    assert!(
+        !resolved.tools.contains_key("mcp__cleanup__ping"),
+        "failed publish must not leak prepared MCP tools into the live runtime"
+    );
+}
+
+#[tokio::test]
+async fn replacing_mcp_registry_closes_previous_registry() {
+    let factory = Arc::new(TrackingMcpRegistryFactory::default());
+    let (_runtime, store, manager) = make_runtime_manager_with_options(
+        None,
+        factory.clone() as Arc<dyn McpRegistryFactory>,
+        Some(Duration::from_secs(5)),
+    )
+    .await;
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "first",
+        &json!({
+            "id": "first",
+            "transport": "stdio",
+            "command": "first-mcp"
+        }),
+    )
+    .await
+    .expect("write first managed mcp server");
+    manager.apply().await.expect("apply first mcp registry");
+
+    let first_state = factory.single_state();
+    assert_eq!(first_state.start_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(first_state.close_calls.load(Ordering::Relaxed), 0);
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "second",
+        &json!({
+            "id": "second",
+            "transport": "stdio",
+            "command": "second-mcp"
+        }),
+    )
+    .await
+    .expect("write second managed mcp server");
+    manager.apply().await.expect("replace mcp registry");
+
+    let states = factory.states();
+    assert_eq!(states.len(), 2);
+    assert_eq!(first_state.close_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(first_state.stop_calls.load(Ordering::Relaxed), 1);
+    assert!(!first_state.periodic_refresh_running.load(Ordering::Relaxed));
+    assert_eq!(states[1].start_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(states[1].close_calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn replacing_mcp_registry_close_failure_does_not_roll_back_new_runtime() {
+    let factory = Arc::new(TrackingMcpRegistryFactory::default());
+    let (runtime, store, manager) = make_runtime_manager_with_options(
+        None,
+        factory.clone() as Arc<dyn McpRegistryFactory>,
+        Some(Duration::from_secs(5)),
+    )
+    .await;
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "first",
+        &json!({
+            "id": "first",
+            "transport": "stdio",
+            "command": "first-mcp"
+        }),
+    )
+    .await
+    .expect("write first managed mcp server");
+    manager.apply().await.expect("apply first mcp registry");
+    let first_state = factory.single_state();
+    first_state.fail_close.store(true, Ordering::Relaxed);
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "second",
+        &json!({
+            "id": "second",
+            "transport": "stdio",
+            "command": "second-mcp"
+        }),
+    )
+    .await
+    .expect("write second managed mcp server");
+
+    manager
+        .apply()
+        .await
+        .expect("previous close failure is advisory after publish");
+
+    assert_eq!(first_state.close_calls.load(Ordering::Relaxed), 1);
+    let resolved = runtime
+        .resolver()
+        .resolve("bootstrap")
+        .expect("bootstrap agent resolves after replacement");
+    assert!(
+        resolved.tools.contains_key("mcp__second__ping"),
+        "new MCP registry must remain published even if closing the old registry fails"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_closes_active_mcp_registry() {
+    let factory = Arc::new(TrackingMcpRegistryFactory::default());
+    let (_runtime, store, manager) = make_runtime_manager_with_options(
+        None,
+        factory.clone() as Arc<dyn McpRegistryFactory>,
+        Some(Duration::from_secs(5)),
+    )
+    .await;
+
+    ConfigStore::put(
+        store.as_ref(),
+        "mcp-servers",
+        "active",
+        &json!({
+            "id": "active",
+            "transport": "stdio",
+            "command": "active-mcp"
+        }),
+    )
+    .await
+    .expect("write active managed mcp server");
+    manager.apply().await.expect("apply active mcp registry");
+
+    let state = factory.single_state();
+    manager.shutdown().await.expect("shutdown config runtime");
+
+    assert_eq!(state.close_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.stop_calls.load(Ordering::Relaxed), 1);
+    assert!(!state.periodic_refresh_running.load(Ordering::Relaxed));
+}
+
+// ── apply / apply_if_changed semantics ──────────────────────────────
+//
+// These tests pin the externally-visible contract of the apply path:
+//   * apply() always rebuilds and publishes a snapshot, returning a
+//     strictly increasing registry version even when the underlying
+//     store is unchanged.
+//   * apply_if_changed() returns Some(version) on first call after a
+//     mutation and None when nothing has changed since the last apply.
+
+#[tokio::test]
+async fn apply_returns_monotonically_advancing_version() {
+    let (_runtime, _store, manager) = make_runtime_manager(None).await;
+
+    let first = manager.apply().await.expect("first apply");
+    let second = manager.apply().await.expect("second apply");
+
+    assert!(
+        second > first,
+        "apply() must always publish and advance the registry version, got {first} then {second}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_apply_calls_are_serialized_and_publish_unique_versions() {
+    let (runtime, store, manager) = make_runtime_manager(None).await;
+    ConfigStore::put(
+        store.as_ref(),
+        "providers",
+        "distributed-apply-provider",
+        &json!({
+            "id": "distributed-apply-provider",
+            "adapter": "stub",
+            "api_key": "test-key"
+        }),
+    )
+    .await
+    .expect("write provider before concurrent applies");
+
+    let workers = 8;
+    let barrier = Arc::new(Barrier::new(workers));
+    let handles = (0..workers)
+        .map(|_| {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.apply().await
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut versions = Vec::with_capacity(workers);
+    for result in futures::future::join_all(handles).await {
+        versions.push(
+            result
+                .expect("apply task must not panic")
+                .expect("concurrent apply must succeed"),
+        );
+    }
+    versions.sort_unstable();
+    let mut unique_versions = versions.clone();
+    unique_versions.dedup();
+
+    assert_eq!(
+        unique_versions.len(),
+        workers,
+        "apply lock must serialize publishes into unique versions: {versions:?}"
+    );
+    assert!(
+        versions.windows(2).all(|window| window[0] < window[1]),
+        "versions must be strictly increasing: {versions:?}"
+    );
+
+    let snapshot = runtime.registry_snapshot().expect("registry snapshot");
+    assert_eq!(
+        snapshot.version(),
+        *versions.last().expect("at least one version"),
+        "live registry must expose the last serialized apply"
+    );
+}
+
+#[tokio::test]
+async fn apply_if_changed_returns_none_when_nothing_changed() {
+    let (_runtime, _store, manager) = make_runtime_manager(None).await;
+
+    let result = manager
+        .apply_if_changed()
+        .await
+        .expect("apply_if_changed succeeds");
+    assert!(
+        result.is_none(),
+        "apply_if_changed must return None when the snapshot fingerprint matches the last applied"
+    );
+}
+
+#[tokio::test]
+async fn apply_reuses_executor_for_unchanged_provider() {
+    let factory = Arc::new(CountingProviderFactory::default());
+    let (_runtime, _store, manager) = make_runtime_manager_custom(
+        None,
+        Arc::new(TestMcpRegistryFactory),
+        None,
+        factory.clone() as Arc<dyn ProviderExecutorFactory>,
+        false,
+        true,
+    )
+    .await;
+
+    let initial_builds = factory.builds_for("bootstrap");
+    assert!(
+        initial_builds >= 1,
+        "bootstrap apply should have built the provider at least once, got {initial_builds}"
+    );
+
+    manager.apply().await.expect("re-apply with no changes");
+
+    assert_eq!(
+        factory.builds_for("bootstrap"),
+        initial_builds,
+        "executor cache must reuse the unchanged provider across applies"
+    );
+}
+
+#[tokio::test]
+async fn change_listener_coalesces_event_bursts_within_min_apply_interval() {
+    let factory = Arc::new(CountingProviderFactory::default());
+    let notifier = Arc::new(TestConfigChangeNotifier::new());
+    let store = Arc::new(InMemoryStore::new());
+
+    let runtime = Arc::new(
+        AgentRuntimeBuilder::new()
+            .with_provider("bootstrap", Arc::new(ImmediateExecutor))
+            .with_in_memory_thread_run_store(store.clone())
+            .build()
+            .expect("build runtime"),
+    );
+
+    let manager = Arc::new(
+        ConfigRuntimeManager::new(runtime.clone(), store.clone() as Arc<dyn ConfigStore>)
+            .expect("config runtime manager")
+            .with_provider_factory(factory.clone() as Arc<dyn ProviderExecutorFactory>)
+            .with_mcp_registry_factory(Arc::new(TestMcpRegistryFactory))
+            .with_change_notifier(notifier.clone() as Arc<dyn ConfigChangeNotifier>)
+            .with_min_apply_interval(Duration::from_millis(200)),
+    );
+    let seed = BuiltinSeedSet {
+        binary_version: "test".to_string(),
+        specs: vec![
+            BuiltinSpec::provider(ProviderSpec {
+                id: "bootstrap".into(),
+                adapter: "stub".into(),
+                ..Default::default()
+            }),
+            BuiltinSpec::model(ModelSpec::new("bootstrap", "bootstrap", "bootstrap-model")),
+            BuiltinSpec::agent(agent_spec("bootstrap", "bootstrap")),
+        ],
+    };
+    manager.apply_seed(&seed).await.expect("apply_seed");
+    manager.apply().await.expect("initial apply");
+    manager
+        .start_periodic_refresh(Duration::from_secs(60))
+        .expect("start change listener");
+
+    let listening = wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+        notifier.subscriber_count() > 0
+    })
+    .await;
+    assert!(listening, "listener should subscribe before publish");
+
+    let initial_builds = factory.builds_for("bootstrap");
+
+    // Mutate provider 4 times rapidly. Each mutation flips the cache miss
+    // bit so the executor gets rebuilt on every apply that runs.
+    for i in 1..=4u64 {
+        let spec = json!({
+            "id": "bootstrap",
+            "adapter": "stub",
+            "api_key": "test-key",
+            "timeout_secs": 100 + i,
+        });
+        (store.clone() as Arc<dyn ConfigStore>)
+            .put("providers", "bootstrap", &spec)
+            .await
+            .expect("write mutated provider");
+        notifier.publish(ConfigChangeEvent {
+            namespace: "providers".into(),
+            id: "bootstrap".into(),
+            kind: ConfigChangeKind::Put,
+        });
+    }
+
+    // Wait long enough for the debounce window to flush.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let new_builds = factory.builds_for("bootstrap") - initial_builds;
+    assert!(
+        (1..=2).contains(&new_builds),
+        "4 events fired within 200ms debounce window must produce 1 or 2 applies — \
+         0 means the listener missed the burst, >2 means coalescing failed (got {new_builds})"
+    );
+}
+
+#[tokio::test]
+async fn apply_rebuilds_executor_when_provider_spec_changes() {
+    let factory = Arc::new(CountingProviderFactory::default());
+    let (_runtime, store, manager) = make_runtime_manager_custom(
+        None,
+        Arc::new(TestMcpRegistryFactory),
+        None,
+        factory.clone() as Arc<dyn ProviderExecutorFactory>,
+        false,
+        true,
+    )
+    .await;
+
+    let initial_builds = factory.builds_for("bootstrap");
+
+    // Mutate the provider spec — different timeout makes the spec unequal,
+    // so the cache must miss and the factory must be invoked again.
+    let mutated = json!({
+        "id": "bootstrap",
+        "adapter": "stub",
+        "api_key": "test-key",
+        "timeout_secs": 999
+    });
+    (store.clone() as Arc<dyn ConfigStore>)
+        .put("providers", "bootstrap", &mutated)
+        .await
+        .expect("write mutated provider");
+
+    manager.apply().await.expect("re-apply after mutation");
+
+    assert!(
+        factory.builds_for("bootstrap") > initial_builds,
+        "provider must be rebuilt when its spec changes (initial {initial_builds}, after {})",
+        factory.builds_for("bootstrap")
+    );
+}
+
+#[tokio::test]
+async fn apply_if_changed_returns_some_after_store_mutation() {
+    let (_runtime, store, manager) = make_runtime_manager(None).await;
+
+    // Mutating the providers namespace must invalidate the previously
+    // applied fingerprint so apply_if_changed publishes again.
+    let new_provider = json!({
+        "id": "extra",
+        "adapter": "stub",
+        "api_key": "test-key"
+    });
+    (store.clone() as Arc<dyn ConfigStore>)
+        .put("providers", "extra", &new_provider)
+        .await
+        .expect("write extra provider");
+
+    let result = manager
+        .apply_if_changed()
+        .await
+        .expect("apply_if_changed succeeds")
+        .expect("store mutation must produce a new fingerprint");
+
+    let after_no_change = manager
+        .apply_if_changed()
+        .await
+        .expect("apply_if_changed succeeds");
+    assert!(
+        after_no_change.is_none(),
+        "calling apply_if_changed twice without further mutation must return None"
+    );
+    let _ = result;
+}
+
+// ── MCP server status and restart endpoint smoke tests ──────────────────────
+
+#[tokio::test]
+async fn mcp_status_routes_absent_without_config_module() {
+    // Build a state without a config module so config-backed MCP admin
+    // endpoints are absent instead of carrying handler-local fallbacks.
+    let store = Arc::new(InMemoryStore::new());
+    let thread_store = store.clone();
+    use remo_runtime::builder::AgentRuntimeBuilder;
+    use remo_server_contract::{AgentSpec, ModelSpec};
+
+    struct StubExecutor;
+    #[async_trait]
+    impl remo_server_contract::contract::executor::LlmExecutor for StubExecutor {
+        async fn execute(
+            &self,
+            _request: remo_server_contract::contract::executor::InferenceRequest,
+        ) -> Result<
+            remo_server_contract::contract::inference::StreamResult,
+            remo_server_contract::contract::executor::InferenceExecutionError,
+        > {
+            Ok(remo_server_contract::contract::inference::StreamResult {
+                content: vec![],
+                tool_calls: vec![],
+                usage: Some(remo_server_contract::contract::inference::TokenUsage::default()),
+                stop_reason: Some(remo_server_contract::contract::inference::StopReason::EndTurn),
+                has_incomplete_tool_calls: false,
+            })
+        }
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    let bootstrap_agent = AgentSpec {
+        id: "boot".into(),
+        model_id: "boot".into(),
+        system_prompt: "boot".into(),
+        max_rounds: 1,
+        ..Default::default()
+    };
+    let runtime = Arc::new(
+        AgentRuntimeBuilder::new()
+            .with_provider("boot", Arc::new(StubExecutor))
+            .with_model(ModelSpec::new("boot", "boot", "m"))
+            .with_agent_spec(bootstrap_agent)
+            .with_in_memory_thread_run_store(thread_store.clone())
+            .build()
+            .expect("runtime"),
+    );
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        thread_store.clone(),
+        "mcp-status-test".into(),
+        MailboxConfig::default(),
+    ));
+    // No config module attached → config-backed MCP admin endpoints are absent.
+    let mut state = remo_server::app::ServerState::new(
+        runtime.clone(),
+        mailbox,
+        thread_store as Arc<dyn remo_server_contract::contract::storage::ThreadRunStore>,
+        runtime.resolver_arc(),
+        ServerConfig::default(),
+    );
+    state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+    let router = build_router(&state);
+
+    let (status, _body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/mcp-servers/anything/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _body) = request_json(
+        &router,
+        Method::POST,
+        "/v1/mcp-servers/anything/restart",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mcp_status_returns_404_for_unknown_server() {
+    // The default test app has no MCP servers registered; querying a name
+    // that the manager doesn't know about should return 404.
+    let app = make_app().await;
+
+    let (status, _body) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/mcp-servers/no-such-server/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// R9 #2 regression: the manager snapshot has session diagnostics
+/// and `last_init_at`. The HTTP wire response forgot to surface them
+/// before R9; this test pins the fix so a future refactor of
+/// `get_mcp_server_status` doesn't silently drop them again. The raw
+/// MCP-Session-Id must never be returned by this route.
+#[tokio::test]
+async fn mcp_status_route_surfaces_session_reconnect_init_fields() {
+    use std::time::SystemTime;
+
+    /// Test-only registry that returns a fully-populated snapshot for
+    /// every server name. We don't care about the tool list here, just
+    /// that the new diagnostic fields make it onto the wire.
+    struct SnapshotStubRegistry {
+        tool_registry: Arc<dyn ToolRegistry>,
+    }
+
+    #[async_trait]
+    impl ManagedMcpRegistry for SnapshotStubRegistry {
+        fn tool_registry(&self) -> Arc<dyn ToolRegistry> {
+            Arc::clone(&self.tool_registry)
+        }
+        fn periodic_refresh_running(&self) -> bool {
+            false
+        }
+        fn start_periodic_refresh(&self, _interval: Duration) -> Result<(), ConfigRuntimeError> {
+            Ok(())
+        }
+        async fn stop_periodic_refresh(&self) -> bool {
+            false
+        }
+        async fn server_status(
+            &self,
+            _server_name: &str,
+        ) -> Option<remo_ext_mcp::McpServerStatusSnapshot> {
+            Some(remo_ext_mcp::McpServerStatusSnapshot {
+                connected: true,
+                last_error: None,
+                tools: vec![],
+                consecutive_failures: 0,
+                last_attempt_at: None,
+                last_success_at: None,
+                reconnecting: false,
+                permanently_failed: false,
+                session_generation: Some(7),
+                transport_reconnect_count: 3,
+                // 2026-05-13 12:00:00 UTC, picked so the conversion to
+                // unix seconds is non-zero and we can assert on it.
+                last_init_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_778_846_400)),
+            })
+        }
+        async fn reconnect(&self, _server_name: &str) -> Result<(), ConfigRuntimeError> {
+            Ok(())
+        }
+    }
+
+    struct SnapshotStubFactory;
+
+    #[async_trait]
+    impl McpRegistryFactory for SnapshotStubFactory {
+        async fn connect(
+            &self,
+            specs: &[McpServerSpec],
+        ) -> Result<Option<Arc<dyn ManagedMcpRegistry>>, ConfigRuntimeError> {
+            if specs.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(SnapshotStubRegistry {
+                tool_registry: Arc::new(MapToolRegistry::new()),
+            }) as Arc<dyn ManagedMcpRegistry>))
+        }
+    }
+
+    let notifier = Arc::new(TestConfigChangeNotifier::new());
+    let (runtime, store, manager) = make_runtime_manager_with_options(
+        Some(notifier.clone() as Arc<dyn ConfigChangeNotifier>),
+        Arc::new(SnapshotStubFactory),
+        None,
+    )
+    .await;
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        store.clone(),
+        "mcp-status-fields-test".into(),
+        MailboxConfig::default(),
+    ));
+    let mut state = ServerState::new(
+        runtime.clone(),
+        mailbox,
+        store.clone(),
+        runtime.resolver_arc(),
+        ServerConfig::default(),
+    );
+    state.config = Some(ConfigModuleState::new(config_store, manager.clone()));
+    state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+    let router = build_router(&state);
+
+    // Register an MCP server so the factory's `connect` is called and
+    // the stub registry becomes active.
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/mcp-servers",
+        Some(json!({
+            "id": "demo",
+            "transport": "http",
+            "url": "http://invalid.test"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) =
+        request_json(&router, Method::GET, "/v1/mcp-servers/demo/status", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["session_generation"], 7,
+        "session_generation must surface; body = {body}"
+    );
+    assert_eq!(
+        body["transport_reconnect_count"], 3,
+        "transport_reconnect_count must surface; body = {body}"
+    );
+    assert!(
+        body.get("session_id").is_none(),
+        "raw MCP session id must not surface"
+    );
+    assert!(
+        body.get("session_id_digest").is_none(),
+        "session digest is intentionally omitted"
+    );
+    assert!(
+        body.get("reconnect_count").is_none(),
+        "ambiguous reconnect_count key must not surface"
+    );
+    assert_eq!(
+        body["last_init_at"], 1_778_846_400,
+        "last_init_at must surface as unix seconds; body = {body}"
+    );
+    // Sanity: existing fields still present (no accidental drop while
+    // adding the new ones).
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["reconnecting"], false);
+}
+
+#[tokio::test]
+async fn mcp_restart_returns_404_for_unknown_server() {
+    // As above: restart on an unknown id should 404 when no MCP registry is
+    // active (the default test app has no configured mcp-servers).
+    let app = make_app().await;
+
+    let (status, _body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/mcp-servers/no-such-server/restart",
+        None,
+    )
+    .await;
+    // The manager returns "no MCP registry is active" → 503.
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ── Agent override endpoint tests ──────────────────────────────────────────
+
+/// Seed a builtin agent with `system_prompt` for override tests.
+/// Uses the already-seeded "bootstrap" agent from `make_app`.
+async fn patch_overrides(router: &axum::Router, id: &str, body: Value) -> (StatusCode, Value) {
+    request_json(
+        router,
+        Method::PATCH,
+        &format!("/v1/config/agents/{id}/overrides"),
+        Some(body),
+    )
+    .await
+}
+
+async fn delete_overrides(router: &axum::Router, id: &str) -> (StatusCode, Value) {
+    request_json(
+        router,
+        Method::DELETE,
+        &format!("/v1/config/agents/{id}/overrides"),
+        None,
+    )
+    .await
+}
+
+async fn delete_override_field(
+    router: &axum::Router,
+    id: &str,
+    field: &str,
+) -> (StatusCode, Value) {
+    request_json(
+        router,
+        Method::DELETE,
+        &format!("/v1/config/agents/{id}/overrides/{field}"),
+        None,
+    )
+    .await
+}
+
+async fn get_agent_spec(router: &axum::Router, id: &str) -> (StatusCode, Value) {
+    request_json(
+        router,
+        Method::GET,
+        &format!("/v1/config/agents/{id}"),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn patch_overrides_on_builtin_returns_effective_spec() {
+    let app = make_app().await;
+
+    // The "bootstrap" agent is seeded as Builtin.
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"system_prompt": "patched"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["system_prompt"], "patched");
+
+    // Verify the store has user_overrides set.
+    use remo_server_contract::contract::config_store::ConfigStore;
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let overrides = &raw["meta"]["user_overrides"];
+    assert_eq!(overrides["system_prompt"], "patched");
+
+    // GET should also return the patched effective spec.
+    let (get_status, get_body) = get_agent_spec(&app.router, "bootstrap").await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(get_body["system_prompt"], "patched");
+}
+
+#[tokio::test]
+async fn patch_overrides_merges_with_existing_overrides() {
+    let app = make_app().await;
+
+    // First patch: system_prompt
+    let (s1, _) = patch_overrides(&app.router, "bootstrap", json!({"system_prompt": "p1"})).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Second patch: max_rounds
+    let (s2, body) = patch_overrides(&app.router, "bootstrap", json!({"max_rounds": 99})).await;
+    assert_eq!(s2, StatusCode::OK, "body: {body}");
+    assert_eq!(body["system_prompt"], "p1");
+    assert_eq!(body["max_rounds"], 99);
+}
+
+#[tokio::test]
+async fn patch_overrides_null_clears_field() {
+    let app = make_app().await;
+
+    // Patch both fields.
+    patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"system_prompt": "p1", "max_rounds": 99}),
+    )
+    .await;
+
+    // Null-out max_rounds.
+    let (status, body) =
+        patch_overrides(&app.router, "bootstrap", json!({"max_rounds": null})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["system_prompt"], "p1");
+    // max_rounds should be reset to the base value (not 99).
+    assert_ne!(body["max_rounds"], 99);
+
+    // Store should only have system_prompt in user_overrides.
+    use remo_server_contract::contract::config_store::ConfigStore;
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let overrides = &raw["meta"]["user_overrides"];
+    assert_eq!(overrides["system_prompt"], "p1");
+    assert!(
+        overrides.get("max_rounds").is_none() || overrides["max_rounds"].is_null(),
+        "max_rounds must not remain in user_overrides"
+    );
+}
+
+// **Contract pin**: `endpoint` is a patchable AgentSpec field through the
+// override API. The admin-console editor treats endpoint as a locked /
+// read-only field for UX simplification, but this is a client-side
+// choice — not a server-enforced immutability boundary. Programmatic
+// clients (CLI, scripts, other admin tooling) can override or clear
+// endpoint through `PATCH /v1/config/agents/:id/overrides`. See the
+// long-form rationale on `AgentSpecPatch::endpoint` in
+// `crates/remo-contract/src/agent_spec_patch.rs`.
+//
+// Changing this behavior (e.g. making endpoint server-side immutable)
+// would be a breaking API change and requires a dedicated ADR.
+#[tokio::test]
+async fn patch_overrides_null_clears_nullable_base_field() {
+    let app = make_app().await;
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+
+    let mut raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    raw["spec"]["endpoint"] = json!({
+        "backend": "a2a",
+        "base_url": "http://127.0.0.1:1",
+        "target": "remote-agent"
+    });
+    raw["spec"]
+        .as_object_mut()
+        .expect("spec object")
+        .remove("backend");
+    ConfigStore::put(app.store.as_ref(), "agents", "bootstrap", &raw)
+        .await
+        .expect("store write");
+
+    let (status, body) = patch_overrides(&app.router, "bootstrap", json!({"endpoint": null})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("endpoint").is_none() || body["endpoint"].is_null(),
+        "effective endpoint must be cleared"
+    );
+
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let overrides = &raw["meta"]["user_overrides"];
+    assert!(
+        overrides.get("endpoint").is_some_and(Value::is_null),
+        "endpoint null must be preserved in user_overrides"
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_backend_replaces_stale_endpoint_projection() {
+    let app = make_app().await;
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+
+    let mut raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    raw["spec"]["endpoint"] = json!({
+        "backend": "a2a",
+        "base_url": "http://127.0.0.1:1",
+        "target": "old-agent"
+    });
+    raw["spec"]
+        .as_object_mut()
+        .expect("spec object")
+        .remove("backend");
+    ConfigStore::put(app.store.as_ref(), "agents", "bootstrap", &raw)
+        .await
+        .expect("store write");
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({
+            "backend": {
+                "kind": "a2a",
+                "version": 1,
+                "config": {
+                    "base_url": "https://next.example.com/a2a",
+                    "target": "next-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["backend"]["kind"], "a2a");
+    assert_eq!(
+        body["backend"]["config"]["base_url"],
+        "https://next.example.com/a2a"
+    );
+    assert_eq!(body["endpoint"]["base_url"], "https://next.example.com/a2a");
+    assert_eq!(body["endpoint"]["target"], "next-agent");
+}
+
+#[tokio::test]
+async fn patch_overrides_rejects_conflicting_backend_and_endpoint() {
+    let app = make_app().await;
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({
+            "backend": {
+                "kind": "a2a",
+                "version": 1,
+                "config": {"base_url": "https://next.example.com/a2a"}
+            },
+            "endpoint": {
+                "backend": "a2a",
+                "base_url": "https://legacy.example.com/a2a"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("backend and endpoint cannot be patched in the same request"),
+        "unexpected body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_rejects_invalid_backend_config_without_secret_echo() {
+    let app = make_app().await;
+    let secret = "backend-secret-should-not-echo";
+
+    let cases = [
+        json!({"backend": {"kind": "a2a", "version": 1, "config": "bad"}}),
+        json!({"backend": {"kind": "a2a", "version": 1, "config": {}}}),
+        json!({"backend": {"kind": "a2a", "version": 1, "config": {"base_url": "ftp://remote.example.com"}}}),
+        json!({"backend": {"kind": "a2a", "version": 1, "config": {
+            "base_url": "https://remote.example.com",
+            "auth": {"type": "bearer", "token": "***"}
+        }}}),
+        json!({"backend": {"kind": "a2a", "version": 1, "config": {
+            "base_url": "https://remote.example.com",
+            "auth": {"type": "basic", "token": secret}
+        }}}),
+    ];
+
+    for body in cases {
+        let (status, response) = patch_overrides(&app.router, "bootstrap", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {response}");
+        let rendered = response.to_string();
+        assert!(
+            !rendered.contains(secret),
+            "validation response leaked backend auth token: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_config_responses_redact_backend_bearer_tokens() {
+    let app = make_app().await;
+    let secret = "backend-list-secret-token";
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({
+            "context_policy": {
+                "max_context_tokens": 123456,
+                "max_output_tokens": 8192,
+                "min_recent_messages": 4,
+                "enable_prompt_cache": true
+            },
+            "backend": {
+                "kind": "a2a",
+                "version": 1,
+                "config": {
+                    "base_url": "https://remote.example.com/a2a",
+                    "auth": {"type": "bearer", "token": secret}
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The PATCH response returns the effective spec directly (it does not go
+    // through GET/list), so it must redact the backend token on the same
+    // boundary.
+    assert!(
+        !body.to_string().contains(secret),
+        "agent PATCH overrides response leaked backend token: {body}"
+    );
+    assert_eq!(body["backend"]["config"]["auth"]["token"], "***");
+
+    let (status, body) = get_agent_spec(&app.router, "bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains(secret),
+        "agent GET response leaked backend token: {rendered}"
+    );
+    assert_eq!(body["backend"]["config"]["auth"]["token"], "***");
+    assert_eq!(body["endpoint"]["auth"]["token"], "***");
+    assert_eq!(body["context_policy"]["max_context_tokens"], 123456);
+    assert_eq!(body["context_policy"]["max_output_tokens"], 8192);
+
+    let (status, list_body) =
+        request_json(&app.router, Method::GET, "/v1/config/agents", None).await;
+    assert_eq!(status, StatusCode::OK, "body: {list_body}");
+    assert!(
+        !list_body.to_string().contains(secret),
+        "agent list response leaked backend token: {list_body}"
+    );
+    let bootstrap = list_body
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.get("id").and_then(Value::as_str) == Some("bootstrap"))
+        })
+        .expect("bootstrap agent in list");
+    assert_eq!(
+        bootstrap["context_policy"]["max_context_tokens"], 123456,
+        "agent list must not redact context token budget fields"
+    );
+    assert_eq!(
+        bootstrap["context_policy"]["max_output_tokens"], 8192,
+        "agent list must not redact output token budget fields"
+    );
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK, "body: {capabilities}");
+    assert!(
+        !capabilities.to_string().contains(secret),
+        "capabilities response leaked backend token: {capabilities}"
+    );
+}
+
+#[tokio::test]
+async fn agent_overrides_preview_and_clear_redact_backend_bearer_tokens() {
+    let app = make_app().await;
+    let secret = "preview-clear-secret-token";
+    let backend = |token: &str| {
+        json!({
+            "kind": "a2a",
+            "version": 1,
+            "config": {
+                "base_url": "https://remote.example.com/a2a",
+                "auth": {"type": "bearer", "token": token}
+            }
+        })
+    };
+
+    // Dry-run preview (POST /overrides) echoes the normalized patch back; the
+    // backend token must be redacted before it leaves the server.
+    let (status, preview) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents/bootstrap/overrides",
+        Some(json!({ "backend": backend(secret) })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {preview}");
+    assert!(
+        !preview.to_string().contains(secret),
+        "overrides preview leaked backend token: {preview}"
+    );
+    assert_eq!(
+        preview["normalized"]["backend"]["config"]["auth"]["token"],
+        "***"
+    );
+
+    // Persist a backend token plus an unrelated override field.
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({ "backend": backend(secret), "description": "remote agent" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // A no-op PATCH (same overrides) returns the effective spec via the
+    // short-circuit path; it must redact too.
+    let (status, noop) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({ "backend": backend(secret), "description": "remote agent" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {noop}");
+    assert!(
+        !noop.to_string().contains(secret),
+        "no-op PATCH overrides leaked backend token: {noop}"
+    );
+    assert_eq!(noop["backend"]["config"]["auth"]["token"], "***");
+
+    // Clearing an unrelated field returns the effective spec, which still
+    // carries the backend override and must remain redacted.
+    let (status, cleared) = delete_override_field(&app.router, "bootstrap", "description").await;
+    assert_eq!(status, StatusCode::OK, "body: {cleared}");
+    assert!(
+        !cleared.to_string().contains(secret),
+        "clear-field response leaked backend token: {cleared}"
+    );
+    assert_eq!(cleared["backend"]["config"]["auth"]["token"], "***");
+}
+
+#[tokio::test]
+async fn redacted_backend_token_placeholder_cannot_be_persisted() {
+    let app = make_app().await;
+
+    // Submitting the redacted placeholder as a real token must be rejected so a
+    // round-tripped GET response can never be saved back as a live credential.
+    let (status, response) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({ "backend": {
+            "kind": "a2a",
+            "version": 1,
+            "config": {
+                "base_url": "https://remote.example.com/a2a",
+                "auth": {"type": "bearer", "token": "***"}
+            }
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {response}");
+
+    // The agent must not have been mutated with the placeholder token.
+    let (status, body) = get_agent_spec(&app.router, "bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["backend"].is_null() || body["backend"]["config"]["auth"]["token"].is_null());
+}
+
+#[tokio::test]
+async fn patch_overrides_sections_null_value_deletes_base_section_key() {
+    let app = make_app().await;
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+
+    let mut raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    raw["spec"]["sections"] = json!({
+        "permission": { "default_behavior": "ask", "rules": [] },
+        "observability": { "enabled": true }
+    });
+    ConfigStore::put(app.store.as_ref(), "agents", "bootstrap", &raw)
+        .await
+        .expect("store write");
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"sections": {"permission": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        !body["sections"]
+            .as_object()
+            .expect("sections object")
+            .contains_key("permission"),
+        "permission section must be deleted from the effective spec"
+    );
+    assert_eq!(body["sections"]["observability"], json!({"enabled": true}));
+
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let section_overrides = raw["meta"]["user_overrides"]["sections"]
+        .as_object()
+        .expect("section overrides object");
+    assert!(
+        section_overrides
+            .get("permission")
+            .is_some_and(Value::is_null),
+        "stored override should preserve the per-section delete marker"
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_sections_null_value_clears_override_only_section_key() {
+    let app = make_app().await;
+
+    let (seed_status, seed_body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"sections": {"draft_only": {"enabled": true}}}),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::OK, "body: {seed_body}");
+    assert_eq!(
+        seed_body["sections"]["draft_only"],
+        json!({"enabled": true})
+    );
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"sections": {"draft_only": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    if let Some(sections) = body.get("sections").and_then(Value::as_object) {
+        assert!(
+            !sections.contains_key("draft_only"),
+            "override-only section must be removed from the effective spec"
+        );
+    }
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    assert!(
+        raw["meta"]["user_overrides"].is_null(),
+        "deleting the only override-only section should clear user_overrides: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_sections_merges_with_existing_section_overrides() {
+    let app = make_app().await;
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+
+    let mut raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    raw["spec"]["sections"] = json!({
+        "permission": { "default_behavior": "ask" },
+        "observability": { "enabled": false }
+    });
+    ConfigStore::put(app.store.as_ref(), "agents", "bootstrap", &raw)
+        .await
+        .expect("store write");
+
+    let (seed_status, _) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({
+            "sections": {
+                "permission": { "default_behavior": "deny" },
+                "observability": { "enabled": true }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::OK);
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"sections": {"permission": {"default_behavior": "allow"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["sections"]["permission"],
+        json!({"default_behavior": "allow"})
+    );
+    assert_eq!(body["sections"]["observability"], json!({"enabled": true}));
+
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let section_overrides = raw["meta"]["user_overrides"]["sections"]
+        .as_object()
+        .expect("section overrides object");
+    assert_eq!(
+        section_overrides.get("permission"),
+        Some(&json!({"default_behavior": "allow"}))
+    );
+    assert_eq!(
+        section_overrides.get("observability"),
+        Some(&json!({"enabled": true}))
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_sections_delete_preserves_existing_sibling_overrides() {
+    let app = make_app().await;
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+
+    let mut raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    raw["spec"]["sections"] = json!({
+        "permission": { "default_behavior": "ask" },
+        "observability": { "enabled": false }
+    });
+    ConfigStore::put(app.store.as_ref(), "agents", "bootstrap", &raw)
+        .await
+        .expect("store write");
+
+    let (seed_status, _) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"sections": {"observability": {"enabled": true}}}),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::OK);
+
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"sections": {"permission": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        !body["sections"]
+            .as_object()
+            .expect("sections object")
+            .contains_key("permission"),
+        "permission section must be deleted from the effective spec"
+    );
+    assert_eq!(body["sections"]["observability"], json!({"enabled": true}));
+
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let section_overrides = raw["meta"]["user_overrides"]["sections"]
+        .as_object()
+        .expect("section overrides object");
+    assert!(
+        section_overrides
+            .get("permission")
+            .is_some_and(Value::is_null),
+        "stored override should preserve the per-section delete marker"
+    );
+    assert_eq!(
+        section_overrides.get("observability"),
+        Some(&json!({"enabled": true}))
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_rejects_unknown_field() {
+    let app = make_app().await;
+
+    let (status, body) =
+        patch_overrides(&app.router, "bootstrap", json!({"unknown_field": "x"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+// R11 #3 — `_clear` directive applies upserts + clears atomically in
+// one PATCH transaction. Replaces the previous client-side
+// PATCH + N×DELETE flow which could leave the record in a partial
+// state if any DELETE failed.
+#[tokio::test]
+async fn patch_overrides_clear_directive_removes_overrides() {
+    let app = make_app().await;
+
+    // Seed two overrides.
+    let (s1, _) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"system_prompt": "kept", "max_rounds": 99}),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Clear `max_rounds` while upserting another field — both in one call.
+    let (s2, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"_clear": ["max_rounds"], "system_prompt": "still-kept"}),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "body={body}");
+    // Effective spec reflects the upsert.
+    assert_eq!(body["system_prompt"], "still-kept");
+    // Effective spec drops the cleared override.
+    use remo_server_contract::contract::config_store::ConfigStore;
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let overrides = raw["meta"]["user_overrides"]
+        .as_object()
+        .expect("overrides obj");
+    assert!(
+        !overrides.contains_key("max_rounds"),
+        "max_rounds override should be cleared, got: {raw}"
+    );
+    assert_eq!(overrides.get("system_prompt"), Some(&json!("still-kept")));
+}
+
+#[tokio::test]
+async fn patch_overrides_clear_directive_accepts_endpoint() {
+    let app = make_app().await;
+
+    let (seed_status, _) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({
+            "endpoint": {
+                "backend": "a2a",
+                "base_url": "https://remote.example.com",
+                "target": "remote-agent"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::OK);
+
+    let (status, body) =
+        patch_overrides(&app.router, "bootstrap", json!({"_clear": ["endpoint"]})).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(
+        body.get("endpoint").is_none() || body["endpoint"].is_null(),
+        "effective endpoint must fall back to the base value"
+    );
+
+    use remo_server_contract::contract::config_store::ConfigStore;
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    let overrides = raw["meta"].get("user_overrides").unwrap_or(&Value::Null);
+    assert!(
+        overrides.is_null()
+            || !overrides
+                .as_object()
+                .expect("user_overrides object")
+                .contains_key("endpoint"),
+        "endpoint override should be cleared, got: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn patch_overrides_clear_rejects_unknown_field_name() {
+    let app = make_app().await;
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"_clear": ["unknown_field"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn patch_overrides_clear_rejects_conflict_with_upsert() {
+    let app = make_app().await;
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"system_prompt": "new", "_clear": ["system_prompt"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn patch_overrides_clear_rejects_endpoint_conflict_with_upsert() {
+    let app = make_app().await;
+    let (status, body) = patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"endpoint": null, "_clear": ["endpoint"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn patch_overrides_clear_rejects_non_array() {
+    let app = make_app().await;
+    let (status, body) =
+        patch_overrides(&app.router, "bootstrap", json!({"_clear": "system_prompt"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn patch_overrides_on_user_record_returns_422() {
+    let app = make_app().await;
+
+    // Create a User-source agent via PUT (regular create).
+    let (create_status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "user-agent-422",
+            "model_id": "bootstrap",
+            "system_prompt": "hello",
+            "max_rounds": 1
+        })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+
+    let (status, body) =
+        patch_overrides(&app.router, "user-agent-422", json!({"system_prompt": "x"})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+}
+
+#[tokio::test]
+async fn patch_overrides_on_missing_agent_returns_404() {
+    let app = make_app().await;
+
+    let (status, _body) = patch_overrides(
+        &app.router,
+        "nonexistent-agent",
+        json!({"system_prompt": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_all_overrides_resets_to_builtin() {
+    let app = make_app().await;
+
+    // Set some overrides first.
+    patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"system_prompt": "customized"}),
+    )
+    .await;
+
+    // Delete all overrides.
+    let (status, body) = delete_overrides(&app.router, "bootstrap").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Store record should have user_overrides = None.
+    use remo_server_contract::contract::config_store::ConfigStore;
+    let raw = ConfigStore::get(app.store.as_ref(), "agents", "bootstrap")
+        .await
+        .expect("store read")
+        .expect("entry present");
+    assert!(
+        raw["meta"].get("user_overrides").is_none() || raw["meta"]["user_overrides"].is_null(),
+        "user_overrides must be None after delete all"
+    );
+
+    // Effective spec should be back to the seed value.
+    let (get_status, get_body) = get_agent_spec(&app.router, "bootstrap").await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(get_body["system_prompt"], "agent bootstrap");
+}
+
+#[tokio::test]
+async fn delete_one_override_field_resets_only_that_field() {
+    let app = make_app().await;
+
+    // Set two overrides.
+    patch_overrides(
+        &app.router,
+        "bootstrap",
+        json!({"system_prompt": "p1", "max_rounds": 99}),
+    )
+    .await;
+
+    // Delete only max_rounds.
+    let (status, body) = delete_override_field(&app.router, "bootstrap", "max_rounds").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // system_prompt override is preserved.
+    assert_eq!(body["system_prompt"], "p1");
+    // max_rounds is back to base (not 99).
+    assert_ne!(body["max_rounds"], 99);
+}
+
+#[tokio::test]
+async fn audit_event_emitted_for_patch_and_delete() {
+    use remo_server::services::audit_log::{AuditLogger, AuditQuery};
+    use remo_server::services::config_service::ConfigService;
+
+    // Test audit via direct service calls (bypassing HTTP routing) to verify
+    // that patch/clear methods emit Update audit events.
+    let config_store = Arc::new(InMemoryStore::new());
+    let thread_store = Arc::new(InMemoryStore::new());
+    let runtime = Arc::new(
+        AgentRuntimeBuilder::new()
+            .with_provider("bootstrap", Arc::new(ImmediateExecutor))
+            .with_in_memory_thread_run_store(thread_store.clone())
+            .build()
+            .expect("build runtime"),
+    );
+    let manager = Arc::new(
+        ConfigRuntimeManager::new(
+            runtime.clone(),
+            config_store.clone() as Arc<dyn ConfigStore>,
+        )
+        .expect("manager")
+        .with_provider_factory(Arc::new(TestProviderFactory)),
+    );
+    let seed = BuiltinSeedSet {
+        binary_version: "test".to_string(),
+        specs: vec![
+            BuiltinSpec::provider(ProviderSpec {
+                id: "bootstrap".into(),
+                adapter: "stub".into(),
+                ..Default::default()
+            }),
+            BuiltinSpec::model(ModelSpec::new("bootstrap", "bootstrap", "bootstrap-model")),
+            BuiltinSpec::agent(agent_spec("bootstrap", "bootstrap")),
+        ],
+    };
+    manager.apply_seed(&seed).await.expect("apply_seed");
+    manager.apply().await.expect("apply");
+
+    let audit_logger = Arc::new(AuditLogger::new(
+        config_store.clone() as Arc<dyn ConfigStore>
+    ));
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        thread_store.clone(),
+        "override-audit-test".into(),
+        MailboxConfig::default(),
+    ));
+    let mut state = remo_server::app::ServerState::new(
+        runtime.clone(),
+        mailbox,
+        thread_store,
+        runtime.resolver_arc(),
+        ServerConfig::default(),
+    );
+    state.config = Some(
+        ConfigModuleState::new(config_store.clone() as Arc<dyn ConfigStore>, manager)
+            .with_audit_log(audit_logger.clone()),
+    );
+    state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+
+    let headers = axum::http::HeaderMap::new();
+
+    // 1. PATCH overrides
+    let service = ConfigService::new(&state).expect("service");
+    service
+        .patch_agent_overrides("bootstrap", json!({"system_prompt": "audited"}), &headers)
+        .await
+        .expect("patch_agent_overrides");
+
+    // Verify state has audit_log
+    assert!(state.audit_log().is_some(), "state should have audit_log");
+
+    // 2. DELETE all overrides
+    let service = ConfigService::new(&state).expect("service");
+    service
+        .clear_agent_overrides("bootstrap", &headers)
+        .await
+        .expect("clear_agent_overrides");
+
+    // Check count after step 2
+    let after_clear = audit_logger
+        .query(AuditQuery::default())
+        .await
+        .expect("after_clear query");
+    assert!(
+        after_clear.items.len() >= 2,
+        "should have 2 events after clear, got {}: {:?}",
+        after_clear.items.len(),
+        after_clear
+            .items
+            .iter()
+            .map(|e| format!("{:?}@{}", e.action, e.resource))
+            .collect::<Vec<_>>()
+    );
+
+    // 3. PATCH again
+    let service = ConfigService::new(&state).expect("service");
+    service
+        .patch_agent_overrides(
+            "bootstrap",
+            json!({"system_prompt": "p1", "max_rounds": 5}),
+            &headers,
+        )
+        .await
+        .expect("patch_agent_overrides 2");
+
+    // 4. DELETE single field
+    let service = ConfigService::new(&state).expect("service");
+    service
+        .clear_agent_override_field("bootstrap", "max_rounds", &headers)
+        .await
+        .expect("clear_agent_override_field");
+
+    // Query audit log — expect at least 3 Update events for agents/bootstrap.
+    let page = audit_logger
+        .query(AuditQuery {
+            action: Some(remo_server_contract::AuditAction::Update),
+            ..Default::default()
+        })
+        .await
+        .expect("audit query");
+
+    // Override mutations now emit with resource path including the
+    // `/overrides[/{field}]` suffix per Phase 3 spec.
+    let agent_updates: Vec<_> = page
+        .items
+        .iter()
+        .filter(|e| {
+            e.resource == "agents/bootstrap/overrides"
+                || e.resource.starts_with("agents/bootstrap/overrides/")
+        })
+        .collect();
+    assert_eq!(
+        agent_updates.len(),
+        4,
+        "expected exactly one Update per non-no-op mutation (patch + clear-all + patch + clear-field), got {} (all: {:?})",
+        agent_updates.len(),
+        page.items
+            .iter()
+            .map(|e| format!("{:?}@{}", e.action, e.resource))
+            .collect::<Vec<_>>()
+    );
+
+    // Specifically: 2 PATCH calls + 1 DELETE all + 1 DELETE field.
+    let single_field_updates: Vec<_> = page
+        .items
+        .iter()
+        .filter(|e| e.resource == "agents/bootstrap/overrides/max_rounds")
+        .collect();
+    assert_eq!(
+        single_field_updates.len(),
+        1,
+        "expected one Update for the per-field DELETE, got {}",
+        single_field_updates.len()
+    );
+}
+
+// ── GET /v1/config/:ns/:id/meta ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_meta_returns_source_and_overrides_for_builtin() {
+    let app = make_app().await;
+
+    // The bootstrap agent is seeded as Builtin.
+    let (status, body) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/agents/bootstrap/meta",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["source"]["kind"], "builtin",
+        "source.kind must be 'builtin'"
+    );
+    assert!(
+        body["source"]["binary_version"].is_string(),
+        "binary_version must be present"
+    );
+    // No overrides on a freshly seeded builtin.
+    assert!(
+        body.get("user_overrides").is_none() || body["user_overrides"].is_null(),
+        "user_overrides should be absent or null for a pristine builtin"
+    );
+}
+
+#[tokio::test]
+async fn get_meta_returns_user_source_for_user_record() {
+    let app = make_app().await;
+
+    // Create a user record.
+    let (create_status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({ "id": "user-agent-meta", "model_id": "bootstrap", "system_prompt": "test", "max_rounds": 1 })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/agents/user-agent-meta/meta",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["source"]["kind"], "user",
+        "user-created record must have source.kind 'user'"
+    );
+}
+
+#[tokio::test]
+async fn get_meta_returns_404_for_missing() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/agents/no-such-agent/meta",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── GET /v1/config/:ns/meta ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_meta_returns_all_records_with_source() {
+    let app = make_app().await;
+
+    // Create a user agent.
+    let (create_status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({ "id": "user-list-meta", "model_id": "bootstrap", "system_prompt": "hi", "max_rounds": 1 })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+
+    let (status, body) =
+        request_json(&app.router, Method::GET, "/v1/config/agents/meta", None).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let items = body.as_array().expect("body must be a JSON array");
+    assert!(
+        !items.is_empty(),
+        "list/meta must return at least one entry"
+    );
+
+    // Every item must have id and meta.source.kind.
+    for item in items {
+        assert!(item["id"].is_string(), "each item must have an id string");
+        let kind = item["meta"]["source"]["kind"].as_str();
+        assert!(
+            matches!(kind, Some("builtin") | Some("user")),
+            "source.kind must be 'builtin' or 'user', got: {kind:?}"
+        );
+    }
+
+    // Confirm both the builtin seed and our user record appear.
+    let bootstrap = items.iter().find(|i| i["id"] == "bootstrap");
+    assert!(
+        bootstrap.is_some(),
+        "bootstrap builtin must be in list/meta"
+    );
+    assert_eq!(bootstrap.unwrap()["meta"]["source"]["kind"], "builtin");
+
+    let user_rec = items.iter().find(|i| i["id"] == "user-list-meta");
+    assert!(user_rec.is_some(), "user-list-meta must be in list/meta");
+    assert_eq!(user_rec.unwrap()["meta"]["source"]["kind"], "user");
+}
+
+// ── Permission preview endpoint (issue #190) ───────────────────────────────
+
+/// Build a router with the permission plugin registered, a stub provider,
+/// and a fixed tool registry. The preview endpoint intersects
+/// `allowed_tools` against the tool registry — without registered tools
+/// the candidate set would always be empty, so we seed a deterministic
+/// set every preview test can reference.
+#[cfg(feature = "permission")]
+async fn make_permission_preview_app() -> axum::Router {
+    let (runtime, store, manager) = make_permission_preview_runtime().await;
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+    let mailbox = Arc::new(Mailbox::new(
+        runtime.clone(),
+        Arc::new(remo_stores::InMemoryMailboxStore::new()),
+        store.clone(),
+        "permission-preview-test".into(),
+        MailboxConfig::default(),
+    ));
+    let mut state = ServerState::new(
+        runtime.clone(),
+        mailbox,
+        store,
+        runtime.resolver_arc(),
+        ServerConfig::default(),
+    );
+    state.config = Some(ConfigModuleState::new(config_store, manager));
+    state.admin.admin_api_config.bearer_token = Some(ADMIN_TOKEN.into());
+    build_router(&state)
+}
+
+/// Standalone runtime+manager+store for permission preview tests, with a
+/// fixed set of tools registered (`Bash`, `Read`, `Edit`, plus a couple
+/// of `mcp__db__*` tools so glob expansion tests can verify behaviour
+/// against real registry entries).
+#[cfg(feature = "permission")]
+async fn make_permission_preview_runtime() -> (
+    Arc<AgentRuntime>,
+    Arc<InMemoryStore>,
+    Arc<ConfigRuntimeManager>,
+) {
+    struct PreviewMockTool {
+        id: String,
+    }
+    #[async_trait]
+    impl Tool for PreviewMockTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor::new(&self.id, &self.id, "preview mock")
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::new(ToolResult::success(
+                &self.id,
+                serde_json::Value::Null,
+            )))
+        }
+    }
+
+    // No-op plugin used by tests that need a second loaded plugin id to
+    // populate `active_hook_filter` against. Defaults on the `Plugin`
+    // trait suffice — descriptor is the only required method.
+    struct NoopPlugin;
+    impl remo_runtime::plugins::Plugin for NoopPlugin {
+        fn descriptor(&self) -> remo_runtime::plugins::PluginDescriptor {
+            remo_runtime::plugins::PluginDescriptor {
+                name: "observability",
+            }
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    let mut builder = AgentRuntimeBuilder::new()
+        .with_provider("bootstrap", Arc::new(ImmediateExecutor))
+        .with_plugin("permission", Arc::new(PermissionPlugin))
+        .with_plugin("observability", Arc::new(NoopPlugin))
+        .with_in_memory_thread_run_store(store.clone());
+    for id in ["Bash", "Read", "Edit", "mcp__db__query", "mcp__db__write"] {
+        builder = builder.with_tool(id, Arc::new(PreviewMockTool { id: id.into() }));
+    }
+    let runtime = Arc::new(builder.build().expect("build preview runtime"));
+    let config_store = store.clone() as Arc<dyn ConfigStore>;
+    let manager = Arc::new(
+        ConfigRuntimeManager::new(runtime.clone(), config_store.clone())
+            .expect("config runtime manager")
+            .with_provider_factory(Arc::new(TestProviderFactory))
+            .with_mcp_registry_factory(Arc::new(TestMcpRegistryFactory)),
+    );
+    let seed = BuiltinSeedSet {
+        binary_version: "test".to_string(),
+        specs: vec![
+            BuiltinSpec::provider(ProviderSpec {
+                id: "bootstrap".into(),
+                adapter: "stub".into(),
+                ..Default::default()
+            }),
+            BuiltinSpec::model(ModelSpec::new("bootstrap", "bootstrap", "bootstrap-model")),
+            BuiltinSpec::agent(agent_spec("bootstrap", "bootstrap")),
+        ],
+    };
+    manager.apply_seed(&seed).await.expect("apply_seed");
+    manager.apply().await.expect("publish config snapshot");
+
+    (runtime, store, manager)
+}
+
+#[cfg(feature = "permission")]
+async fn seed_provider_and_model(router: &axum::Router) {
+    let (status, _) = request_json(
+        router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({ "id": "stub-provider", "adapter": "stub", "api_key": "test-key" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = request_json(
+        router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": "stub-model",
+            "provider_id": "stub-provider",
+            "upstream_model": "any"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_returns_candidate_set_without_permission_plugin() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "no-perm-agent",
+            "model_id": "stub-model",
+            "system_prompt": "no permission plugin",
+            // Use ids that exist in the test runtime registry (Bash/Read/Edit
+            // are seeded by `make_permission_preview_runtime`). After the R7
+            // registry-intersection fix, ids not in the registry are
+            // filtered out — covered by a dedicated test below.
+            "allowed_tools": ["Bash", "Read"],
+            "excluded_tools": ["Read"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/no-perm-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["agent_id"], "no-perm-agent");
+    assert_eq!(body["permission_plugin_enabled"], false);
+    assert!(body["default_behavior"].is_null());
+    // candidate = allowed ∖ excluded = ["Bash"]
+    assert_eq!(body["candidate_tools"], json!(["Bash"]));
+    // No permission plugin -> effective == candidate.
+    assert_eq!(body["effective_tools"], json!(["Bash"]));
+    assert_eq!(body["unconditionally_denied"], json!([]));
+    assert_eq!(body["args_conditional_rules"], json!([]));
+}
+
+// R7 #2 — preview filters `allowed_tools` against the registry. A stale
+// id (renamed plugin, removed MCP server, typo) must NOT appear in
+// `effective_tools` because the runtime tool catalog never offers it.
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_intersects_allowed_tools_with_registry() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "stale-tools-agent",
+            "model_id": "stub-model",
+            "system_prompt": "stale tool list",
+            // `ghost_tool` is not registered; the runtime would never
+            // offer it. The preview must drop it.
+            "allowed_tools": ["Bash", "ghost_tool", "another-ghost"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/stale-tools-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["candidate_tools"], json!(["Bash"]));
+    assert_eq!(body["effective_tools"], json!(["Bash"]));
+}
+
+// R7 #3 — glob/regex Deny + any-args rules expand against the registry
+// into `unconditionally_denied`. Without this fix a `mcp__db__*` Deny
+// rule would only appear in `args_conditional_rules` while
+// `effective_tools` still listed `mcp__db__query` etc., even though
+// the runtime BeforeInference hook would strip them on every call.
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_expands_glob_deny_against_registry() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "glob-deny-agent",
+            "model_id": "stub-model",
+            "system_prompt": "deny all mcp__db__*",
+            "plugin_ids": ["permission"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "mcp__db__*", "behavior": "deny" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/glob-deny-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    // Both registered mcp__db__* tools are now in the unconditionally
+    // denied list — not hiding in args_conditional_rules.
+    let denied = body["unconditionally_denied"]
+        .as_array()
+        .expect("unconditionally_denied is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(denied.contains(&"mcp__db__query".to_string()));
+    assert!(denied.contains(&"mcp__db__write".to_string()));
+    // Effective tools no longer carry them.
+    let effective = body["effective_tools"]
+        .as_array()
+        .expect("effective_tools is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(!effective.contains(&"mcp__db__query".to_string()));
+    assert!(!effective.contains(&"mcp__db__write".to_string()));
+    // The glob Deny no longer double-appears in args_conditional_rules.
+    let args_conditional = body["args_conditional_rules"]
+        .as_array()
+        .expect("args_conditional_rules is an array");
+    assert!(
+        !args_conditional.iter().any(
+            |r| r["behavior"] == "deny" && r["pattern"].as_str().unwrap().contains("mcp__db__")
+        ),
+        "glob deny should be in unconditionally_denied, not args_conditional_rules"
+    );
+}
+
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_subtracts_unconditionally_denied_tools() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "perm-agent",
+            "model_id": "stub-model",
+            "system_prompt": "permission-gated",
+            "plugin_ids": ["permission"],
+            "allowed_tools": ["Bash", "Read", "Edit"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "Bash", "behavior": "deny" },
+                        { "tool": "Read", "behavior": "allow" },
+                        { "tool": "Edit(/etc/*)", "behavior": "deny" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/perm-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["permission_plugin_enabled"], true);
+    assert_eq!(body["default_behavior"], "ask");
+    assert_eq!(body["candidate_tools"], json!(["Bash", "Edit", "Read"]));
+    assert_eq!(body["unconditionally_denied"], json!(["Bash"]));
+    // Bash stripped; Edit kept (the deny is args-conditional on path).
+    assert_eq!(body["effective_tools"], json!(["Edit", "Read"]));
+    let args = body["args_conditional_rules"]
+        .as_array()
+        .expect("args_conditional_rules should be a list");
+    assert!(
+        args.iter()
+            .any(|r| r["tool"] == "Edit" && r["behavior"] == "deny"),
+        "expected Edit(/etc/*) deny rule in args_conditional_rules, got {body}",
+    );
+}
+
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_404_for_unknown_agent() {
+    let router = make_permission_preview_app().await;
+    let (status, _body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/no-such-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// R8 #1 — `active_hook_filter` excludes the permission plugin from the
+// hook dispatcher even though the plugin itself is loaded. The runtime
+// won't run permission BeforeInference hooks in this state, so preview
+// must report enabled=false and emit candidate_tools as effective_tools.
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_respects_active_hook_filter_excluding_permission() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, body) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "filtered-out-agent",
+            "model_id": "stub-model",
+            "system_prompt": "permission loaded but filtered",
+            // Both plugins are loaded by the runtime; the filter
+            // restricts hook dispatch to observability only —
+            // permission hooks will NOT run.
+            "plugin_ids": ["permission", "observability"],
+            "active_hook_filter": ["observability"],
+            "allowed_tools": ["Bash", "Read"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "Bash", "behavior": "deny" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/filtered-out-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["permission_plugin_enabled"], false,
+        "filtered-out permission plugin must report disabled"
+    );
+    // No deny is applied since the hook won't run.
+    assert_eq!(body["unconditionally_denied"], json!([]));
+    assert_eq!(body["candidate_tools"], body["effective_tools"]);
+}
+
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_respects_active_hook_filter_including_permission() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "filter-includes-permission-agent",
+            "model_id": "stub-model",
+            "system_prompt": "permission loaded and admitted",
+            "plugin_ids": ["permission", "observability"],
+            "active_hook_filter": ["permission"],
+            "allowed_tools": ["Bash", "Read"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "Bash", "behavior": "deny" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/filter-includes-permission-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["permission_plugin_enabled"], true);
+    assert_eq!(body["unconditionally_denied"], json!(["Bash"]));
+}
+
+// R8 #4 — `unconditionally_denied` must only count tools that were in
+// the candidate set. A deny rule for a tool the agent already wouldn't
+// see (because allowed_tools excluded it) is NOT a "strip" — the UI
+// summary "N tools stripped before the model sees the list" would
+// otherwise overstate.
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_unconditionally_denied_intersects_candidate() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "denied-outside-candidate-agent",
+            "model_id": "stub-model",
+            "system_prompt": "deny rules target tools outside candidate set",
+            "plugin_ids": ["permission"],
+            // Candidate set is just Bash; the deny rule targets a
+            // glob the agent never had access to.
+            "allowed_tools": ["Bash"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "mcp__db__*", "behavior": "deny" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/denied-outside-candidate-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["candidate_tools"], json!(["Bash"]));
+    // `mcp__db__query` etc. matched the deny rule but they were never
+    // in the candidate set — they are NOT counted as "stripped".
+    assert_eq!(body["unconditionally_denied"], json!([]));
+    assert_eq!(body["effective_tools"], json!(["Bash"]));
+}
+
+// R10 #1 — agent not found must return 404, NOT the 404 the client
+// previously interpreted as "permission feature not compiled". The
+// route is registered unconditionally and returns 503 only when the
+// `permission` feature is off (see permission_preview_route_returns_503_when_feature_disabled
+// in the `cfg(not(feature = "permission"))` test module).
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_404_body_distinguishes_missing_agent() {
+    let router = make_permission_preview_app().await;
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/ghost-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let err = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err.contains("agent not found"),
+        "404 body must identify the missing agent (got: {err})"
+    );
+}
+
+// R10 #3 — `args_conditional_rules` must not list rules whose tool
+// target is outside the candidate set. Such rules can never bite at
+// runtime; the operator would mistake them for "still gating tools the
+// model can call".
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_args_conditional_drops_rules_outside_candidate() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "args-cond-outside-candidate-agent",
+            "model_id": "stub-model",
+            "system_prompt": "args-conditional rule targets non-candidate tool",
+            "plugin_ids": ["permission"],
+            // Candidate is just `Bash`; the args-pattern rule targets
+            // `Read` which the agent never had access to.
+            "allowed_tools": ["Bash"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        { "tool": "Read(/etc/*)", "behavior": "deny" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/args-cond-outside-candidate-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    // The Read(/etc/*) rule must NOT show up; Read is outside candidate.
+    assert_eq!(body["args_conditional_rules"], json!([]));
+}
+
+// R12 #1 — `effective_tools = candidate ∖ unconditionally_denied`.
+// An args-conditional rule on an unconditionally-denied tool cannot
+// fire at runtime (the tool is stripped before any call reaches the
+// permission layer), so the preview must not list it.
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_drops_args_rules_on_unconditionally_denied_tools() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "args-on-denied-agent",
+            "model_id": "stub-model",
+            "system_prompt": "args rule on a denied tool",
+            "plugin_ids": ["permission"],
+            "allowed_tools": ["Bash", "Read"],
+            "sections": {
+                "permission": {
+                    "default_behavior": "ask",
+                    "rules": [
+                        // Bash is unconditionally denied.
+                        { "tool": "Bash", "behavior": "deny" },
+                        // Args-conditional rule on the SAME tool —
+                        // can never bite once Bash is stripped.
+                        { "tool": "Bash(npm *)", "behavior": "ask" }
+                    ]
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/args-on-denied-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["unconditionally_denied"], json!(["Bash"]));
+    assert_eq!(body["effective_tools"], json!(["Read"]));
+    // The Bash(npm *) ask rule must NOT show — Bash is already
+    // stripped before any call reaches the permission layer.
+    assert_eq!(
+        body["args_conditional_rules"],
+        json!([]),
+        "args rule on an unconditionally-denied tool must be dropped"
+    );
+}
+
+// R12 #6 — Sections-less agent: the `permission` plugin is loaded but
+// the agent never wrote a `sections.permission` entry. `AgentSpec::config`
+// returns `Config::default()` in this case, so the preview should
+// succeed with the default behavior and no rules — NOT 400.
+#[cfg(feature = "permission")]
+#[tokio::test]
+async fn permission_preview_handles_missing_permission_section() {
+    let router = make_permission_preview_app().await;
+    seed_provider_and_model(&router).await;
+    let (status, _) = request_json(
+        &router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "permission-no-section-agent",
+            "model_id": "stub-model",
+            "system_prompt": "permission plugin loaded, no section",
+            "plugin_ids": ["permission"],
+            "allowed_tools": ["Bash"],
+            // No `sections.permission` entry at all.
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = request_json(
+        &router,
+        Method::GET,
+        "/v1/agents/permission-no-section-agent/permission-preview",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "missing permission section must NOT error — defaults apply: body={body}"
+    );
+    assert_eq!(body["permission_plugin_enabled"], true);
+    // Default behavior is `ask` (PermissionRulesConfig::default()).
+    assert_eq!(body["default_behavior"], "ask");
+    assert_eq!(body["unconditionally_denied"], json!([]));
+    assert_eq!(body["args_conditional_rules"], json!([]));
+    assert_eq!(body["candidate_tools"], json!(["Bash"]));
+    assert_eq!(body["effective_tools"], json!(["Bash"]));
+}
+
+// Round-trip the four catalog fields (literal allow + pattern allow +
+// literal exclude + pattern exclude) through POST -> GET -> PUT -> GET.
+// Asserts that pattern fields aren't dropped by serde, the envelope
+// wrap/unwrap, or the API handlers. Pins the on-the-wire shape so a
+// future change that quietly stops persisting the new fields would
+// fail loudly here.
+#[tokio::test]
+async fn put_agent_spec_round_trips_pattern_fields() {
+    let app = make_app().await;
+
+    let spec = json!({
+        "id": "pattern-round-trip",
+        "model_id": "bootstrap",
+        "system_prompt": "",
+        "allowed_tools": ["Bash"],
+        "allowed_tool_patterns": ["mcp:*"],
+        "excluded_tool_patterns": ["dangerous-*"]
+    });
+
+    let (post_status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(spec.clone()),
+    )
+    .await;
+    assert_eq!(post_status, StatusCode::CREATED, "POST failed: {created}");
+    assert_eq!(created["allowed_tools"], json!(["Bash"]));
+    assert_eq!(created["allowed_tool_patterns"], json!(["mcp:*"]));
+    assert_eq!(created["excluded_tool_patterns"], json!(["dangerous-*"]));
+    // `excluded_tools` was not set; serde skips serialising `None`.
+    assert!(
+        created.get("excluded_tools").is_none(),
+        "excluded_tools should be absent when unset, got: {created}"
+    );
+
+    let (get_status, got) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/agents/pattern-round-trip",
+        None,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(got["allowed_tools"], json!(["Bash"]));
+    assert_eq!(got["allowed_tool_patterns"], json!(["mcp:*"]));
+    assert_eq!(got["excluded_tool_patterns"], json!(["dangerous-*"]));
+    assert!(
+        got.get("excluded_tools").is_none(),
+        "GET should omit unset excluded_tools, got: {got}"
+    );
+
+    // PUT a full replacement that mutates each catalog field — including
+    // adding the previously-absent `excluded_tools` literal — to confirm
+    // the update path also persists all four fields.
+    let updated_spec = json!({
+        "id": "pattern-round-trip",
+        "model_id": "bootstrap",
+        "system_prompt": "",
+        "allowed_tools": ["Read"],
+        "allowed_tool_patterns": ["mcp:db-*", "Bash"],
+        "excluded_tools": ["Delete"],
+        "excluded_tool_patterns": ["dangerous-*", "legacy-*"]
+    });
+    let (put_status, put_body) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/agents/pattern-round-trip",
+        Some(updated_spec),
+    )
+    .await;
+    assert_eq!(put_status, StatusCode::OK, "PUT failed: {put_body}");
+    assert_eq!(put_body["allowed_tools"], json!(["Read"]));
+    assert_eq!(
+        put_body["allowed_tool_patterns"],
+        json!(["mcp:db-*", "Bash"])
+    );
+    assert_eq!(put_body["excluded_tools"], json!(["Delete"]));
+    assert_eq!(
+        put_body["excluded_tool_patterns"],
+        json!(["dangerous-*", "legacy-*"])
+    );
+
+    let (final_status, final_got) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/agents/pattern-round-trip",
+        None,
+    )
+    .await;
+    assert_eq!(final_status, StatusCode::OK);
+    assert_eq!(final_got["allowed_tools"], json!(["Read"]));
+    assert_eq!(
+        final_got["allowed_tool_patterns"],
+        json!(["mcp:db-*", "Bash"])
+    );
+    assert_eq!(final_got["excluded_tools"], json!(["Delete"]));
+    assert_eq!(
+        final_got["excluded_tool_patterns"],
+        json!(["dangerous-*", "legacy-*"])
+    );
+}
+
+// ── S2 wire test: models namespace + duplicate-id defense ───────────────
+
+#[tokio::test]
+async fn config_models_namespace_round_trip_with_capability_fields() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({"id":"prov","adapter":"stub","api_key":"test-key"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": "m1",
+            "provider_id": "prov",
+            "upstream_model": "gpt-4o",
+            "context_window": 128_000,
+            "max_output_tokens": 16_384,
+            "modalities": {"input": ["text", "image"], "output": ["text"]},
+            "knowledge_cutoff": "2026-01"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {created}");
+
+    let (status, got) = request_json(&app.router, Method::GET, "/v1/config/models/m1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["context_window"], 128_000);
+    assert_eq!(got["max_output_tokens"], 16_384);
+    assert_eq!(got["knowledge_cutoff"], "2026-01");
+    assert_eq!(got["modalities"]["input"], json!(["text", "image"]));
+    assert_eq!(got["modalities"]["output"], json!(["text"]));
+
+    // GET /v1/capabilities must also surface the full ModelSpec — admin UI
+    // dropdowns and external dashboards read this endpoint and the TS type
+    // is declared as `ModelSpec[]`.
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let models = capabilities["models"]
+        .as_array()
+        .expect("capabilities.models must be an array");
+    let entry = models
+        .iter()
+        .find(|m| m["id"] == "m1")
+        .expect("capabilities.models must include the registered model");
+    assert_eq!(entry["provider_id"], "prov");
+    assert_eq!(entry["upstream_model"], "gpt-4o");
+    assert_eq!(entry["context_window"], 128_000);
+    assert_eq!(entry["max_output_tokens"], 16_384);
+    assert_eq!(entry["knowledge_cutoff"], "2026-01");
+    assert_eq!(entry["modalities"]["input"], json!(["text", "image"]));
+    assert_eq!(entry["modalities"]["output"], json!(["text"]));
+}
+
+#[tokio::test]
+async fn config_models_namespace_rejects_duplicate_id_via_namespace_keying() {
+    let app = make_app().await;
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({"id":"prov","adapter":"stub","api_key":"test-key"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let body = json!({"id":"dup","provider_id":"prov","upstream_model":"gpt-4o"});
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/models",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, conflict) =
+        request_json(&app.router, Method::POST, "/v1/config/models", Some(body)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {conflict}");
+}
+
+async fn create_stub_provider(app: &TestApp, id: &str) {
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/providers",
+        Some(json!({
+            "id": id,
+            "adapter": "stub",
+            "api_key": "test-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+}
+
+async fn create_stub_model(app: &TestApp, id: &str, provider_id: &str) {
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/models",
+        Some(json!({
+            "id": id,
+            "provider_id": provider_id,
+            "upstream_model": format!("{id}-upstream")
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+}
+
+#[tokio::test]
+async fn model_pools_crud_round_trip() {
+    let app = make_app().await;
+
+    create_stub_provider(&app, "pool-provider").await;
+    create_stub_model(&app, "claude-direct", "pool-provider").await;
+    create_stub_model(&app, "claude-bedrock", "pool-provider").await;
+
+    let (status, capabilities) =
+        request_json(&app.router, Method::GET, "/v1/capabilities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        capabilities.to_string().contains("model-pools"),
+        "capabilities must advertise the model-pools namespace: {capabilities}"
+    );
+
+    let (status, created) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/model-pools",
+        Some(json!({
+            "id": "claude-pool",
+            "members": [
+                {"model_id": "claude-direct"},
+                {"model_id": "claude-bedrock", "role": "failover_only"}
+            ],
+            "routing": {"home": "deterministic"},
+            "switch": {"on_quota": true}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={created}");
+    assert_eq!(created["id"], "claude-pool");
+
+    let (status, fetched) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/model-pools/claude-pool",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched["members"].as_array().unwrap().len(), 2);
+
+    let (status, list) =
+        request_json(&app.router, Method::GET, "/v1/config/model-pools", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(contains_id(
+        list["items"].as_array().unwrap(),
+        "claude-pool"
+    ));
+
+    let (status, updated) = request_json(
+        &app.router,
+        Method::PUT,
+        "/v1/config/model-pools/claude-pool",
+        Some(json!({
+            "id": "claude-pool",
+            "members": [{"model_id": "claude-direct"}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={updated}");
+    assert_eq!(updated["members"].as_array().unwrap().len(), 1);
+
+    let (status, deleted) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/model-pools/claude-pool",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body={deleted}");
+
+    let (status, _) = request_json(
+        &app.router,
+        Method::GET,
+        "/v1/config/model-pools/claude-pool",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn model_pool_rejects_invalid_payload() {
+    let app = make_app().await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/model-pools",
+        Some(json!({"id": "empty-pool", "members": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(body["error"].as_str().unwrap().contains("member"));
+}
+
+#[tokio::test]
+async fn model_pool_rejects_unknown_member_model() {
+    let app = make_app().await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/model-pools",
+        Some(json!({
+            "id": "bad-pool",
+            "members": [{"model_id": "missing-model"}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error string")
+            .contains("model pool 'bad-pool' references missing model 'missing-model'"),
+        "body={body}"
+    );
+
+    let stored = ConfigStore::get(app.store.as_ref(), "model-pools", "bad-pool")
+        .await
+        .expect("read rolled-back pool");
+    assert!(stored.is_none(), "invalid pool must roll back");
+}
+
+#[tokio::test]
+async fn agent_can_reference_model_pool_and_resolve() {
+    let app = make_app().await;
+
+    create_stub_provider(&app, "pool-provider").await;
+    create_stub_model(&app, "pool-m0", "pool-provider").await;
+    create_stub_model(&app, "pool-m1", "pool-provider").await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/model-pools",
+        Some(json!({
+            "id": "shared-pool",
+            "members": [
+                {"model_id": "pool-m0"},
+                {"model_id": "pool-m1", "role": "failover_only"}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+
+    let (status, agent) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/agents",
+        Some(json!({
+            "id": "pooled-agent",
+            "model_id": "shared-pool",
+            "system_prompt": "use the pool",
+            "max_rounds": 2
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={agent}");
+
+    let resolved = app
+        .runtime
+        .resolver()
+        .resolve("pooled-agent")
+        .expect("agent should resolve through model pool");
+    assert_eq!(resolved.model_id(), "shared-pool");
+    assert_eq!(resolved.upstream_model, "shared-pool");
+}
+
+#[tokio::test]
+async fn delete_model_blocked_when_model_pool_uses_it() {
+    let app = make_app().await;
+
+    create_stub_provider(&app, "pool-provider").await;
+    create_stub_model(&app, "pooled-model", "pool-provider").await;
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::POST,
+        "/v1/config/model-pools",
+        Some(json!({
+            "id": "model-user-pool",
+            "members": [{"model_id": "pooled-model"}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+
+    let (status, body) = request_json(
+        &app.router,
+        Method::DELETE,
+        "/v1/config/models/pooled-model",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    let used_by = body["used_by"].as_array().expect("used_by array");
+    assert!(
+        used_by.iter().any(|record| {
+            record["namespace"] == "model-pools" && record["id"] == "model-user-pool"
+        }),
+        "should report the pool that references the model: {body}"
+    );
+}

@@ -1,0 +1,20 @@
+{
+  "id": "03_token_budget",
+  "description": "Verbosity guard — the model must answer concisely (≤ 30 total tokens). `max_duration_ms` is intentionally omitted: scoring reads `metrics.session_duration_ms`, which is sub-millisecond for scripted replays and would always pass — adding it would create false confidence in duration coverage.",
+  "user_input": "Reply with the digit nine.",
+  "provider_script": [
+    {
+      "kind": "chat_response",
+      "content": "9",
+      "tokens": {
+        "prompt_tokens": 6,
+        "completion_tokens": 1,
+        "total_tokens": 7
+      }
+    }
+  ],
+  "expect": {
+    "final_answer_contains": ["9"],
+    "max_tokens_total": 30
+  }
+}

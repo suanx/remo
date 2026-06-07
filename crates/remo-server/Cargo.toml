@@ -1,0 +1,99 @@
+[package]
+name = "remo-server"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Multi-protocol HTTP server with SSE, mailbox, and protocol adapters for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = [
+    "artificial-intelligence",
+    "asynchronous",
+    "network-programming",
+    "web-programming",
+]
+
+[dependencies]
+remo-server-contract = { workspace = true }
+remo-protocol-a2a = { workspace = true }
+remo-tool-pattern = { workspace = true }
+remo-runtime = { workspace = true }
+remo-stores = { workspace = true, features = ["file", "sqlite"] }
+remo-ext-mcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "time"] }
+axum = { workspace = true, features = ["http1", "json", "matched-path", "query", "tokio"] }
+tower = { workspace = true, features = ["limit"] }
+tower-http = { workspace = true, features = ["cors", "trace", "fs"] }
+async-stream = "0.3"
+tokio-stream = "0.1"
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = "1"
+reqwest = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
+genai = { workspace = true }
+schemars = { workspace = true }
+subtle = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# MCP server
+mcp = { workspace = true, features = ["server", "client"] }
+
+# Audit log
+ulid = "1"
+sha2 = "0.10"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Metrics / observability
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+remo-ext-observability = { workspace = true }
+
+# Eval (ADR-0032 D6: dataset CRUD + trace→fixture curation)
+remo-eval = { path = "../remo-eval" }
+
+# Optional
+remo-ext-permission = { workspace = true, optional = true }
+
+[[bin]]
+name = "remo-server"
+path = "src/main.rs"
+required-features = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+remo-runtime = { workspace = true, features = ["test-utils"] }
+remo-ext-observability = { workspace = true, features = ["otel"] }
+# Re-link remo-eval with `test-support` so `eval_api.rs` can use the
+# shared stub executors / judges instead of redefining them locally.
+remo-eval = { path = "../remo-eval", features = ["test-support"] }
+phoenix-test-helpers = { path = "../../e2e/phoenix/test-helpers" }
+async-trait = { workspace = true }
+genai = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "json"] }
+tempfile = { workspace = true }
+testcontainers = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = ["permission"]
+permission = ["dep:remo-ext-permission"]
+otel = []
+
+[lints]
+workspace = true

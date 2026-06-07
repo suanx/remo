@@ -1,0 +1,33 @@
+[package]
+name = "remo-ext-generative-ui"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Server-driven UI component plugin (A2UI) for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "gui"]
+
+[features]
+default = []
+openui = []
+json-render = []
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

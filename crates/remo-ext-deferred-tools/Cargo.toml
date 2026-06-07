@@ -1,0 +1,28 @@
+[package]
+name = "remo-ext-deferred-tools"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Deferred tool loading with ToolSearch and probability-based deferral for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+remo-tool-pattern = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

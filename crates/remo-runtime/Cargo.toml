@@ -1,0 +1,62 @@
+[package]
+name = "remo-runtime"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Phase-based execution engine, plugin system, and agent loop for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "asynchronous"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-protocol-a2a = { workspace = true }
+remo-tool-pattern = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+typedmap = { workspace = true }
+uuid = { workspace = true }
+genai = { workspace = true }
+tokio = { workspace = true }
+# `form` is required by the credential broker's OAuth token-exchange call
+# (POST application/x-www-form-urlencoded). Workspace default already enables `json`.
+reqwest = { workspace = true, features = ["form"] }
+schemars = { workspace = true }
+jsonschema = { workspace = true }
+parking_lot = { workspace = true }
+metrics = { workspace = true }
+regex = { workspace = true }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"], optional = true }
+remo-stores = { workspace = true, optional = true }
+
+[features]
+default = ["a2a", "handoff", "background", "credentials-google"]
+a2a = []
+handoff = []
+background = []
+parallel-tools = []
+test-utils = ["dep:remo-stores"]
+# Compile the Google OAuth (service-account JWT-Bearer) credential signer.
+# When disabled, providers configured with credentials_kind="service_account_json"
+# will fail at first mint with a clear error.
+credentials-google = ["dep:jsonwebtoken"]
+
+[dev-dependencies]
+remo-runtime = { path = ".", features = ["test-utils"] }
+# Test-only: store traits + the ThreadRunStore-backed checkpoint reader adapter
+# live in server-contract. A dev-dependency keeps server-contract OUT of the
+# runtime library's dependency graph (no reverse dependency), while letting the
+# runtime's own integration-flavored unit tests wire a store-backed reader.
+remo-server-contract = { workspace = true }
+tokio = { workspace = true }
+proptest = { workspace = true }
+metrics-util = "0.20"
+
+[lints]
+workspace = true

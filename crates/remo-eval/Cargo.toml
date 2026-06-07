@@ -1,0 +1,48 @@
+[package]
+name = "remo-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Fixture-driven replay and scoring framework for remo agent runs"
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+remo-ext-observability = { workspace = true }
+remo-stores = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing = { workspace = true }
+
+# HTTP client for the LLM-backed grader (`TensorZeroJudge` /
+# `LlmExecutorJudge`). The CLI no longer wraps `/v1/eval/*` so reqwest is
+# only pulled in via the judge code path.
+reqwest = { workspace = true, features = ["json"] }
+
+# ULID for globally unique, lexicographically-sortable EvalRun ids.
+ulid = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+# Self-link enables `remo_eval::test_support` inside this crate's
+# integration tests (which see the lib without `cfg(test)`).
+remo-eval = { path = ".", features = ["test-support"] }
+
+[features]
+default = []
+# LLM-backed grading via TensorZero `[functions.judge]`. Enables the
+# `judge` module; reqwest is a base dependency, no extra feature flag.
+llm-judge = []
+# Exposes `remo_eval::test_support` — shared stub executors / judges
+# used by this crate's lib + integration tests and by downstream crates
+# (e.g. remo-server's eval_api tests). Pure additive: no production
+# code depends on it.
+test-support = []
+
+[lints]
+workspace = true

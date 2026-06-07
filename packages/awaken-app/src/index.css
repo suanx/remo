@@ -1,0 +1,406 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   REMO AI — GLOBAL DESIGN SYSTEM
+   科技感暗黑风 · 靛蓝/紫色渐变 · 毛玻璃 · 微光晕
+   ============================================================ */
+
+/* ---------- CSS Variables (Dark Theme Default) ---------- */
+:root {
+  --color-bg-primary: #0a0a1a;
+  --color-bg-secondary: #0f0f1a;
+  --color-bg-card: rgba(26, 26, 46, 0.8);
+  --color-bg-glass: rgba(255, 255, 255, 0.06);
+  --color-bg-elevated: #1a1a2e;
+  --color-bg-overlay: rgba(0, 0, 0, 0.4);
+
+  --color-text-primary: #f0f0f5;
+  --color-text-secondary: #a0a0b8;
+  --color-text-tertiary: #6b6b80;
+  --color-text-inverse: #0a0a1a;
+  --color-text-placeholder: #55556b;
+
+  --color-border-primary: rgba(255, 255, 255, 0.08);
+  --color-border-secondary: rgba(255, 255, 255, 0.05);
+  --color-border-hover: rgba(99, 102, 241, 0.5);
+
+  --color-primary: #6366f1;
+  --color-primary-light: #818cf8;
+  --color-primary-dark: #4f46e5;
+  --color-primary-gradient: linear-gradient(135deg, #6366f1, #8b5cf6);
+  --color-primary-soft: rgba(99, 102, 241, 0.2);
+
+  --color-accent: #22d3ee;
+  --color-accent-soft: rgba(34, 211, 238, 0.15);
+  --color-success: #34d399;
+  --color-success-soft: rgba(52, 211, 153, 0.15);
+  --color-warning: #fbbf24;
+  --color-error: #f87171;
+  --color-error-soft: rgba(248, 113, 113, 0.15);
+
+  --glass-bg: rgba(255, 255, 255, 0.06);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --glass-blur: 20px;
+
+  --glow-primary: rgba(99, 102, 241, 0.5);
+  --glow-accent: rgba(34, 211, 238, 0.4);
+  --glow-success: rgba(52, 211, 153, 0.4);
+  --glow-error: rgba(248, 113, 113, 0.4);
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.5);
+  --shadow-glow: 0 0 20px rgba(99, 102, 241, 0.5);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-full: 9999px;
+
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono',
+    monospace;
+
+  --sidebar-width: 240px;
+  --header-height: 56px;
+  --transition-theme: background-color 0.3s ease, border-color 0.3s ease,
+    color 0.3s ease, box-shadow 0.3s ease, opacity 0.3s ease;
+}
+
+/* ---------- Base Styles ---------- */
+*,
+*::before,
+*::after {
+  transition: var(--transition-theme);
+}
+
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #0a0a1a 0%, #0f0f1a 100%);
+  color: var(--color-text-primary);
+  line-height: 1.6;
+}
+
+code,
+pre,
+.font-mono,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+::selection {
+  background-color: var(--color-primary-soft);
+  color: var(--color-text-primary);
+}
+
+a {
+  color: var(--color-primary-light);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Custom Scrollbar ---------- */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+/* ============================================================
+   GLASS MORPHISM
+   ============================================================ */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-card {
+  background: var(--color-bg-card);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease,
+    var(--transition-theme);
+}
+
+.glass-card:hover {
+  box-shadow: var(--shadow-lg);
+  border-color: var(--color-border-hover);
+}
+
+.glass-card-primary {
+  background: var(--color-primary-soft);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+.glass-card-accent {
+  background: var(--color-accent-soft);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+/* ============================================================
+   GRADIENT TEXT & BACKGROUNDS
+   ============================================================ */
+.gradient-text {
+  background: var(--color-primary-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gradient-bg {
+  background: linear-gradient(-45deg, #0a0a1a, #1a1a3e, #6366f1, #8b5cf6, #22d3ee);
+  background-size: 400% 400%;
+  animation: gradient-shift 10s ease infinite;
+}
+
+.gradient-bg-subtle {
+  background: linear-gradient(135deg, var(--color-primary-soft), var(--color-accent-soft));
+  background-size: 200% 200%;
+  animation: gradient-shift 8s ease infinite;
+}
+
+@keyframes gradient-shift {
+  0%   { background-position: 0% 50%; }
+  25%  { background-position: 50% 0%; }
+  50%  { background-position: 100% 50%; }
+  75%  { background-position: 50% 100%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* ============================================================
+   NEON GLOW EFFECTS
+   ============================================================ */
+
+/* --- Neon Text Glow --- */
+.neon-text {
+  color: #fff;
+  text-shadow:
+    0 0 4px var(--glow-primary),
+    0 0 8px var(--glow-primary),
+    0 0 16px var(--glow-primary),
+    0 0 32px var(--glow-primary);
+}
+
+.neon-text-accent {
+  color: #fff;
+  text-shadow:
+    0 0 4px var(--glow-accent),
+    0 0 8px var(--glow-accent),
+    0 0 16px var(--glow-accent),
+    0 0 32px var(--glow-accent);
+}
+
+.neon-text-success {
+  color: #fff;
+  text-shadow:
+    0 0 4px var(--glow-success),
+    0 0 8px var(--glow-success),
+    0 0 16px var(--glow-success);
+}
+
+/* --- Neon Box Glow --- */
+.neon-box {
+  box-shadow:
+    0 0 4px var(--glow-primary),
+    0 0 8px var(--glow-primary),
+    0 0 16px var(--glow-primary),
+    inset 0 0 8px rgba(99, 102, 241, 0.1);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.neon-box-accent {
+  box-shadow:
+    0 0 4px var(--glow-accent),
+    0 0 8px var(--glow-accent),
+    0 0 16px var(--glow-accent),
+    inset 0 0 8px rgba(34, 211, 238, 0.1);
+  border: 1px solid rgba(34, 211, 238, 0.3);
+}
+
+/* --- Pulsing Neon Glow Animation --- */
+.neon-pulse {
+  animation: neonPulse 2s ease-in-out infinite;
+}
+
+@keyframes neonPulse {
+  0%, 100% {
+    box-shadow:
+      0 0 4px var(--glow-primary),
+      0 0 8px var(--glow-primary);
+    border-color: rgba(99, 102, 241, 0.2);
+  }
+  50% {
+    box-shadow:
+      0 0 8px var(--glow-primary),
+      0 0 16px var(--glow-primary),
+      0 0 32px var(--glow-primary);
+    border-color: rgba(99, 102, 241, 0.5);
+  }
+}
+
+/* ============================================================
+   TYPEWRITER / TYPING ANIMATION
+   ============================================================ */
+
+/* Character-by-character reveal (for typing effect) */
+.typing-text {
+  display: inline;
+  overflow: hidden;
+  white-space: pre-wrap;
+  animation: typingReveal 0.05s steps(1) forwards;
+}
+
+@keyframes typingReveal {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Blinking cursor */
+.typing-cursor::after {
+  content: '▊';
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--color-primary-light);
+  animation: cursorBlink 1s steps(1) infinite;
+}
+
+@keyframes cursorBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Typewriter container — reveals text character by character */
+.typewriter {
+  display: inline-block;
+  overflow: hidden;
+  white-space: nowrap;
+  border-right: 2px solid var(--color-primary-light);
+  animation:
+    typewriter 2s steps(30) 1s forwards,
+    blinkCaret 0.8s step-end infinite;
+}
+
+@keyframes typewriter {
+  from { width: 0; }
+  to { width: 100%; }
+}
+
+@keyframes blinkCaret {
+  from, to { border-color: transparent; }
+  50% { border-color: var(--color-primary-light); }
+}
+
+/* ============================================================
+   UTILITY CLASSES
+   ============================================================ */
+
+/* Flex center helper */
+.flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Text truncation */
+.text-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Smooth appearance on mount */
+.fade-in-mount {
+  animation: fadeIn 0.4s ease-out forwards;
+}
+
+.slide-up-mount {
+  animation: slideUp 0.4s ease-out forwards;
+}
+
+
+/* Keyframe definitions */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+
+
+/* ============================================================
+   LAYOUT HELPERS
+   ============================================================ */
+
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.main-content {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  padding: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+@media (max-width: 768px) {
+  .main-content {
+    margin-left: 0;
+  }
+}

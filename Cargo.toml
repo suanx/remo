@@ -1,0 +1,115 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/remo",
+    "crates/remo-agent",
+    "crates/remo-contract",
+    "crates/remo-runtime-contract",
+    "crates/remo-server-contract",
+    "crates/remo-protocol-a2a",
+    "crates/remo-stores",
+    "crates/remo-runtime",
+    "crates/remo-ext-permission",
+    "crates/remo-ext-observability",
+    "crates/remo-ext-mcp",
+    "crates/remo-ext-skills",
+    "crates/remo-ext-reminder",
+    "crates/remo-ext-generative-ui",
+    "crates/remo-ext-deferred-tools",
+    "crates/remo-ext-sandbox",
+    "crates/remo-ext-rag",
+    "crates/remo-ext-workflow",
+    "crates/remo-ext-memory",
+    "crates/remo-ext-multimodal",
+    "crates/remo-ext-playground",
+    "crates/remo-ext-search",
+    "crates/remo-ext-evaluator",
+    "crates/remo-ext-notifications",
+    "crates/remo-ext-opencode",
+    "crates/remo-ext-xfyun",
+    "crates/remo-ext-agnes",
+    "crates/remo-ext-media-gen",
+    "crates/remo-tool-pattern",
+    "crates/remo-server",
+    "crates/remo-doctest",
+    "crates/remo-eval",
+]
+
+
+[workspace.package]
+version = "0.5.1-dev"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/suanx/remo"
+homepage = "https://github.com/suanx/remo"
+keywords = ["ai-agent", "llm", "agent-framework", "tool-use", "multi-agent"]
+rust-version = "1.93"
+
+[workspace.dependencies]
+remo-contract = { version = "0.5.1-dev", path = "crates/remo-contract" }
+remo-runtime-contract = { version = "0.5.1-dev", path = "crates/remo-runtime-contract" }
+remo-server-contract = { version = "0.5.1-dev", path = "crates/remo-server-contract" }
+remo-protocol-a2a = { version = "0.5.1-dev", path = "crates/remo-protocol-a2a" }
+remo-stores = { version = "0.5.1-dev", path = "crates/remo-stores" }
+remo-runtime = { version = "0.5.1-dev", path = "crates/remo-runtime" }
+remo-eval = { version = "0.5.1-dev", path = "crates/remo-eval" }
+remo-ext-permission = { version = "0.5.1-dev", path = "crates/remo-ext-permission" }
+remo-ext-observability = { version = "0.5.1-dev", path = "crates/remo-ext-observability" }
+remo-ext-mcp = { version = "0.5.1-dev", path = "crates/remo-ext-mcp" }
+remo-ext-memory = { version = "0.5.1-dev", path = "crates/remo-ext-memory" }
+remo-ext-rag = { version = "0.5.1-dev", path = "crates/remo-ext-rag" }
+remo-ext-multimodal = { version = "0.5.1-dev", path = "crates/remo-ext-multimodal" }
+remo-ext-workflow = { version = "0.5.1-dev", path = "crates/remo-ext-workflow" }
+remo-ext-sandbox = { version = "0.5.1-dev", path = "crates/remo-ext-sandbox" }
+remo-ext-playground = { version = "0.5.1-dev", path = "crates/remo-ext-playground" }
+remo-ext-skills = { version = "0.5.1-dev", path = "crates/remo-ext-skills" }
+remo-ext-reminder = { version = "0.5.1-dev", path = "crates/remo-ext-reminder" }
+remo-ext-generative-ui = { version = "0.5.1-dev", path = "crates/remo-ext-generative-ui" }
+remo-ext-deferred-tools = { version = "0.5.1-dev", path = "crates/remo-ext-deferred-tools" }
+remo-ext-search = { version = "0.5.1-dev", path = "crates/remo-ext-search" }
+remo-ext-evaluator = { version = "0.5.1-dev", path = "crates/remo-ext-evaluator" }
+remo-ext-notifications = { version = "0.5.1-dev", path = "crates/remo-ext-notifications" }
+remo-ext-voice = { version = "0.5.1-dev", path = "crates/remo-ext-voice" }
+remo-tool-pattern = { version = "0.5.1-dev", path = "crates/remo-tool-pattern" }
+remo-server = { version = "0.5.1-dev", path = "crates/remo-server" }
+glob-match = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+typedmap = { version = "0.6", features = ["clone"] }
+uuid = { version = "1", features = ["v7"] }
+genai = "0.6.0-beta.17"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+reqwest = { version = "0.13", features = ["json"] }
+url = "2.5"
+schemars = "1"
+agent-client-protocol-schema = "0.11"
+agent-client-protocol = "0.10.4"
+jsonschema = "0.45"
+parking_lot = "0.12"
+proptest = "1"
+secrecy = { version = "0.10", features = ["serde"] }
+subtle = "2.6"
+tokio-util = { version = "0.7", features = ["compat"] }
+bytes = "1"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+tempfile = "3"
+testcontainers = "0.23"
+clap = { version = "4", features = ["derive", "env"] }
+mcp = { package = "model-context-protocol", version = "0.2", default-features = false }
+axum = { version = "0.7", default-features = false }
+tower = "0.5"
+tower-http = "0.6"
+sqlx = { version = "0.8", default-features = false }
+tracing-subscriber = "0.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

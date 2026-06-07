@@ -1,0 +1,21 @@
+[package]
+name = "remo-tool-pattern"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Glob and regex pattern matching for tool IDs in Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "development-tools"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+glob-match = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

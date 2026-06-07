@@ -1,0 +1,755 @@
+//! Resolution pipeline: `agent_id` + `RegistrySet` -> `ResolvedAgent` /
+//! `ExecutionPlan`.
+
+mod capability_runtime;
+mod catalog;
+mod filter;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::error::RuntimeError;
+use crate::execution::SequentialToolExecutor;
+use crate::phase::ExecutionEnv;
+use crate::plugins::Plugin;
+#[cfg(feature = "a2a")]
+use crate::registry::ResolvedBackendAgent;
+use crate::registry::{AgentResolver, ResolvedAgent};
+use crate::resolution::{
+    ExecutionPlan, ExecutionRole, RegistryResolutionScope, ResolutionRequest, ResolutionTarget,
+    ResolveError as RunResolveError, ResolvedRunPlan, Resolver,
+};
+use async_trait::async_trait;
+use remo_runtime_contract::contract::executor::LlmExecutor;
+use remo_runtime_contract::contract::tool::Tool;
+#[cfg(feature = "a2a")]
+use remo_runtime_contract::registry_spec::RemoteEndpoint;
+use remo_runtime_contract::registry_spec::{AgentSpec, ModelSpec};
+
+use crate::registry::model_capabilities::ModelCapabilitySources;
+use crate::registry::snapshot::RegistryHandle;
+use crate::registry::traits::RegistrySet;
+
+use self::filter::filter_tools;
+use super::error::ResolveError;
+
+// ---------------------------------------------------------------------------
+// inject_default_plugins()
+// ---------------------------------------------------------------------------
+
+/// Inject runtime-required default plugins into a plugin list.
+///
+/// These plugins are always needed for the agent loop to function correctly.
+/// Called from both the resolve pipeline and `build_agent_env()`.
+pub(crate) fn inject_default_plugins(
+    mut plugins: Vec<Arc<dyn Plugin>>,
+    max_rounds: usize,
+) -> Vec<Arc<dyn Plugin>> {
+    plugins.push(Arc::new(
+        crate::loop_runner::actions::LoopActionHandlersPlugin,
+    ));
+    plugins.push(Arc::new(crate::policies::MaxRoundsPlugin::new(max_rounds)));
+    plugins
+}
+
+pub(crate) fn inject_default_plugins_with_stop_policies(
+    mut plugins: Vec<Arc<dyn Plugin>>,
+    max_rounds: usize,
+    mut stop_policies: Vec<Arc<dyn crate::policies::StopPolicy>>,
+) -> Vec<Arc<dyn Plugin>> {
+    if stop_policies.is_empty() {
+        return inject_default_plugins(plugins, max_rounds);
+    }
+
+    plugins.push(Arc::new(
+        crate::loop_runner::actions::LoopActionHandlersPlugin,
+    ));
+    let mut policies: Vec<Arc<dyn crate::policies::StopPolicy>> =
+        vec![Arc::new(crate::policies::MaxRoundsPolicy::new(max_rounds))];
+    policies.append(&mut stop_policies);
+    plugins.push(Arc::new(crate::policies::StopConditionPlugin::new(
+        policies,
+    )));
+    plugins
+}
+
+// ---------------------------------------------------------------------------
+// resolve()
+// ---------------------------------------------------------------------------
+
+/// Resolve an agent by ID from registries into a fully wired local [`ResolvedAgent`].
+///
+/// Three-stage pipeline:
+/// 1. **Lookup** — fetch spec, model, executor from registries.
+/// 2. **Plugin pipeline** — resolve plugins, inject defaults, validate config.
+/// 3. **Tool pipeline** — collect global + delegate + plugin tools, filter.
+pub(crate) fn resolve_registry_set(
+    registries: &RegistrySet,
+    agent_id: &str,
+) -> Result<ResolvedAgent, ResolveError> {
+    // Stage 1: Lookup
+    let spec = lookup_spec(registries, agent_id)?;
+    #[cfg(feature = "a2a")]
+    if spec.uses_remote_backend() {
+        return Err(ResolveError::RemoteAgentNotDirectlyRunnable(
+            spec.id.clone(),
+        ));
+    }
+    let (executor, upstream_model, model, capability_sources) =
+        resolve_model_and_executor(registries, &spec)?;
+    let spec = effective_runtime_spec(registries, spec, &model)?;
+
+    // Stage 2: Plugin pipeline
+    let plugins = build_plugin_chain(registries, &spec, &model, &capability_sources)?;
+    let env = ExecutionEnv::from_plugins(&plugins, &spec.active_hook_filter)?;
+
+    // Stage 3: Tool pipeline
+    let tools = build_tool_set(registries, &spec, &env)?;
+
+    // Build ResolvedAgent with all fields
+    let spec_arc = Arc::new(spec);
+
+    Ok(ResolvedAgent {
+        spec: spec_arc,
+        upstream_model,
+        tools,
+        llm_executor: executor,
+        tool_executor: Arc::new(SequentialToolExecutor),
+        context_summarizer: None,
+        #[cfg(feature = "background")]
+        background_manager: None,
+        stream_checkpoint_store: None,
+        env,
+    })
+}
+
+/// Resolve an agent into a local or non-local execution plan.
+pub(crate) fn resolve_execution_registry_set(
+    registries: &RegistrySet,
+    agent_id: &str,
+) -> Result<ExecutionPlan, ResolveError> {
+    let spec = lookup_spec(registries, agent_id)?;
+
+    #[cfg(feature = "a2a")]
+    if let Some(endpoint) = remote_endpoint_or_error(&spec)? {
+        let factory = registries
+            .backends
+            .get_backend_factory(&endpoint.backend)
+            .ok_or_else(|| ResolveError::UnsupportedRemoteBackend {
+                agent_id: spec.id.clone(),
+                backend: endpoint.backend.clone(),
+            })?;
+        factory
+            .validate(&endpoint)
+            .map_err(|error| ResolveError::InvalidRemoteEndpointConfig {
+                agent_id: spec.id.clone(),
+                backend: endpoint.backend.clone(),
+                message: error.to_string(),
+            })?;
+        return Ok(ExecutionPlan::Remote(ResolvedBackendAgent::with_factory(
+            Arc::new(spec),
+            factory,
+            endpoint,
+        )));
+    }
+
+    resolve_local_spec(registries, spec).map(|agent| ExecutionPlan::from_resolved_agent(&agent))
+}
+
+#[cfg(test)]
+fn resolve(registries: &RegistrySet, agent_id: &str) -> Result<ResolvedAgent, ResolveError> {
+    resolve_registry_set(registries, agent_id)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: Lookup
+// ---------------------------------------------------------------------------
+
+/// Fetch and validate the agent spec from registry.
+fn lookup_spec(registries: &RegistrySet, agent_id: &str) -> Result<AgentSpec, ResolveError> {
+    registries
+        .agents
+        .get_agent(agent_id)
+        .ok_or_else(|| ResolveError::AgentNotFound(agent_id.into()))
+}
+
+fn effective_runtime_spec(
+    registries: &RegistrySet,
+    mut spec: AgentSpec,
+    model: &ModelSpec,
+) -> Result<AgentSpec, ResolveError> {
+    if let Some(policy) = spec.context_policy.as_ref() {
+        spec.context_policy = Some(crate::context::effective_policy(policy, model));
+    }
+    normalize_compaction_summary_model(registries, &mut spec, model)?;
+    Ok(spec)
+}
+
+fn normalize_compaction_summary_model(
+    registries: &RegistrySet,
+    spec: &mut AgentSpec,
+    agent_model: &ModelSpec,
+) -> Result<(), ResolveError> {
+    if !spec
+        .sections
+        .contains_key(<crate::context::CompactionConfigKey as remo_runtime_contract::registry_spec::PluginConfigKey>::KEY)
+    {
+        return Ok(());
+    }
+    let mut config = spec
+        .config::<crate::context::CompactionConfigKey>()
+        .map_err(|error| match error {
+            remo_runtime_contract::StateError::KeyDecode { key, message } => {
+                ResolveError::InvalidPluginConfig {
+                    plugin: crate::context::CONTEXT_COMPACTION_PLUGIN_ID.into(),
+                    key,
+                    message,
+                }
+            }
+            other => ResolveError::EnvBuild(other),
+        })?;
+    let Some(summary_model) = config
+        .summary_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(summary_model_spec) = registries.models.get_model(summary_model) else {
+        return Ok(());
+    };
+    if summary_model_spec.provider_id != agent_model.provider_id {
+        return Err(ResolveError::InvalidPluginConfig {
+            plugin: crate::context::CONTEXT_COMPACTION_PLUGIN_ID.into(),
+            key: <crate::context::CompactionConfigKey as remo_runtime_contract::registry_spec::PluginConfigKey>::KEY
+                .into(),
+            message: format!(
+                "summary_model `{summary_model}` resolves to provider `{}`, but compaction uses the agent executor for provider `{}`; use a model on the same provider or an upstream model override",
+                summary_model_spec.provider_id, agent_model.provider_id
+            ),
+        });
+    }
+    config.summary_model = Some(summary_model_spec.upstream_model);
+    spec.set_config::<crate::context::CompactionConfigKey>(config)
+        .map_err(ResolveError::EnvBuild)
+}
+
+fn resolve_local_spec(
+    registries: &RegistrySet,
+    spec: AgentSpec,
+) -> Result<ResolvedAgent, ResolveError> {
+    let (executor, upstream_model, model, capability_sources) =
+        resolve_model_and_executor(registries, &spec)?;
+    let spec = effective_runtime_spec(registries, spec, &model)?;
+    let plugins = build_plugin_chain(registries, &spec, &model, &capability_sources)?;
+    let env = ExecutionEnv::from_plugins(&plugins, &spec.active_hook_filter)?;
+    let tools = build_tool_set(registries, &spec, &env)?;
+    let spec_arc = Arc::new(spec);
+
+    Ok(ResolvedAgent {
+        spec: spec_arc,
+        upstream_model,
+        tools,
+        llm_executor: executor,
+        tool_executor: Arc::new(SequentialToolExecutor),
+        context_summarizer: None,
+        #[cfg(feature = "background")]
+        background_manager: None,
+        stream_checkpoint_store: None,
+        env,
+    })
+}
+
+/// Resolve model and LLM executor, applying the agent retry policy.
+///
+/// Returns the resolved executor, upstream model name, and the resolved
+/// [`ModelSpec`] so downstream stages (e.g. `build_plugin_chain`) can use
+/// the model's capabilities without re-querying the registry.
+fn resolve_model_and_executor(
+    registries: &RegistrySet,
+    spec: &AgentSpec,
+) -> Result<
+    (
+        Arc<dyn LlmExecutor>,
+        String,
+        ModelSpec,
+        ModelCapabilitySources,
+    ),
+    ResolveError,
+> {
+    let policy = spec
+        .config::<crate::engine::RetryConfigKey>()
+        .map_err(|error| match error {
+            remo_runtime_contract::StateError::KeyDecode { key, message } => {
+                ResolveError::InvalidPluginConfig {
+                    plugin: "retry".into(),
+                    key,
+                    message,
+                }
+            }
+            other => ResolveError::EnvBuild(other),
+        })?;
+
+    let model = registries.models.get_model(&spec.model_id);
+    let pool = registries.models.get_pool(&spec.model_id);
+    match (pool, model) {
+        (Some(_), Some(_)) => {
+            return Err(ResolveError::AmbiguousModelReference(spec.model_id.clone()));
+        }
+        (Some(pool), None) => {
+            // A model id may name a pool; pools share the model id namespace and
+            // the agent id is the deterministic home key.
+            return super::pool::build_pool_executor(registries, &pool, &spec.id, &policy);
+        }
+        (None, Some(model)) => {
+            let provider_source = registries
+                .providers
+                .provider_capability_source(&model.provider_id);
+            let discovered = registries
+                .providers
+                .provider_model_capability(&model.provider_id, &model.upstream_model);
+            let resolved = crate::registry::model_capabilities::resolve_model_capabilities(
+                model,
+                provider_source.as_deref(),
+                discovered.as_ref(),
+            );
+            let model = resolved.model;
+            let capability_sources = resolved.sources;
+
+            let executor = registries
+                .providers
+                .get_provider(&model.provider_id)
+                .ok_or_else(|| ResolveError::ProviderNotFound(model.provider_id.clone()))?;
+
+            let executor = if policy.max_retries > 0 {
+                Arc::new(crate::engine::RetryingExecutor::new(executor, policy))
+                    as Arc<dyn LlmExecutor>
+            } else {
+                executor
+            };
+            let executor = crate::engine::ModalityGuardExecutor::wrap_trusted(
+                executor,
+                &model,
+                capability_sources.input_modalities,
+            );
+
+            let upstream_model = model.upstream_model.clone();
+            return Ok((executor, upstream_model, model, capability_sources));
+        }
+        (None, None) => {}
+    }
+
+    Err(ResolveError::ModelNotFound(spec.model_id.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: Plugin pipeline
+// ---------------------------------------------------------------------------
+
+/// Resolve plugins by ID, inject defaults, add conditional plugins, validate.
+///
+/// `model` is the already-resolved [`ModelSpec`] from stage 1; the conditional
+/// context-policy plugins clamp against its capabilities without re-querying
+/// the registry.
+fn build_plugin_chain(
+    registries: &RegistrySet,
+    spec: &AgentSpec,
+    model: &ModelSpec,
+    capability_sources: &ModelCapabilitySources,
+) -> Result<Vec<Arc<dyn Plugin>>, ResolveError> {
+    // User-declared plugins
+    let plugins = resolve_plugins(registries, spec)?;
+
+    // Runtime-required default plugins
+    let stop_policies = crate::policies::policies_from_specs(&spec.stop_conditions);
+    let mut plugins =
+        inject_default_plugins_with_stop_policies(plugins, spec.max_rounds, stop_policies);
+
+    if let Some(cutoff) =
+        capability_runtime::knowledge_cutoff_context(spec, model, capability_sources)?
+    {
+        plugins.push(Arc::new(crate::context::KnowledgeCutoffPlugin::new(cutoff)));
+    }
+
+    // Conditional plugins (only when context_policy is set)
+    if let Some(ref policy) = spec.context_policy {
+        let effective = crate::context::effective_policy(policy, model);
+        let compaction_config = spec
+            .config::<crate::context::CompactionConfigKey>()
+            .unwrap_or_default();
+        plugins.push(Arc::new(crate::context::CompactionPlugin::new(
+            compaction_config,
+        )));
+        let transform_config = spec
+            .config::<crate::context::ContextTransformConfigKey>()
+            .unwrap_or_default();
+        plugins.push(Arc::new(
+            crate::context::ContextTransformPlugin::with_config(effective, transform_config),
+        ));
+    }
+
+    // Validate spec sections against plugin-declared schemas
+    validate_sections(spec, &plugins)?;
+
+    Ok(plugins)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: Tool pipeline
+// ---------------------------------------------------------------------------
+
+/// Collect tools from all sources, detect conflicts, apply filters.
+///
+/// Tool sources (merged in order):
+/// 1. Global tools from `ToolRegistry` (builder-registered)
+/// 2. Delegate agent tools (A2A, created from `spec.delegates`)
+/// 3. Plugin-registered tools (from `ExecutionEnv`)
+///
+/// After merging, `allowed_tools`/`excluded_tools` filtering is applied.
+fn build_tool_set(
+    registries: &RegistrySet,
+    spec: &AgentSpec,
+    env: &ExecutionEnv,
+) -> Result<HashMap<String, Arc<dyn Tool>>, ResolveError> {
+    let mut tools = collect_global_tools(registries);
+
+    // Merge delegate agent tools
+    resolve_delegate_tools(registries, spec, &mut tools)?;
+
+    // Merge plugin-registered tools (conflict with global = error)
+    for (tool_id, tool) in &env.tools {
+        if tools.contains_key(tool_id) {
+            return Err(ResolveError::ToolIdConflict {
+                tool_id: tool_id.clone(),
+                source_a: "global".into(),
+                source_b: "plugin".into(),
+            });
+        }
+        tools.insert(tool_id.clone(), Arc::clone(tool));
+    }
+
+    // Capture the registered tool ids BEFORE filtering, so unmatched-pattern
+    // diagnostics aren't confused by tools the catalog itself just removed.
+    let pre_filter_ids: Vec<String> = tools.keys().cloned().collect();
+    filter_tools(&mut tools, spec);
+    let pre_refs: Vec<&str> = pre_filter_ids.iter().map(String::as_str).collect();
+    for (field, pattern) in catalog::unmatched_patterns(spec, &pre_refs) {
+        tracing::warn!(
+            agent_id = %spec.id,
+            catalog_field = field,
+            catalog_pattern = %pattern,
+            "catalog pattern matches no registered tool"
+        );
+    }
+    for (field, entry) in catalog::argument_pattern_misuse(spec) {
+        tracing::warn!(
+            agent_id = %spec.id,
+            catalog_field = field,
+            catalog_entry = %entry,
+            "catalog entry looks like a permission argument pattern; \
+             move to sections[\"permission\"] instead"
+        );
+    }
+    let surviving: Vec<&str> = tools.keys().map(String::as_str).collect();
+    for name in catalog::permission_rules_without_catalog_match(spec, &surviving) {
+        tracing::warn!(
+            agent_id = %spec.id,
+            permission_tool = %name,
+            "permission rule references a tool filtered out by the agent's catalog"
+        );
+    }
+
+    Ok(tools)
+}
+
+/// Create delegate agent tools from `spec.delegates`.
+#[cfg_attr(not(feature = "a2a"), allow(unused_variables))]
+fn resolve_delegate_tools(
+    registries: &RegistrySet,
+    spec: &AgentSpec,
+    tools: &mut HashMap<String, Arc<dyn Tool>>,
+) -> Result<(), ResolveError> {
+    #[cfg(feature = "a2a")]
+    if !spec.delegates.is_empty() {
+        let resolver: Arc<dyn crate::registry::AgentResolver> =
+            Arc::new(RegistrySetResolver::new(registries.clone()));
+        for delegate_id in &spec.delegates {
+            let delegate_spec = registries
+                .agents
+                .get_agent(delegate_id)
+                .ok_or_else(|| ResolveError::AgentNotFound(delegate_id.clone()))?;
+
+            let description = delegate_spec.display_description();
+            if let Some(endpoint) = remote_endpoint_or_error(&delegate_spec)? {
+                let factory = registries
+                    .backends
+                    .get_backend_factory(&endpoint.backend)
+                    .ok_or_else(|| ResolveError::UnsupportedRemoteBackend {
+                        agent_id: delegate_id.clone(),
+                        backend: endpoint.backend.clone(),
+                    })?;
+                factory.validate(&endpoint).map_err(|error| {
+                    ResolveError::InvalidRemoteEndpointConfig {
+                        agent_id: delegate_id.clone(),
+                        backend: endpoint.backend.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+            }
+
+            let tool: Arc<dyn Tool> =
+                Arc::new(crate::extensions::a2a::AgentTool::with_execution_resolver(
+                    delegate_id,
+                    &description,
+                    resolver.clone(),
+                ));
+            let tool_id = tool.descriptor().id;
+            tools.insert(tool_id, tool);
+        }
+    }
+    #[cfg(not(feature = "a2a"))]
+    if !spec.delegates.is_empty() {
+        tracing::warn!(
+            agent_id = %spec.id,
+            "agent has delegates but 'a2a' feature is disabled; delegates ignored"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "a2a")]
+fn remote_endpoint_or_error(spec: &AgentSpec) -> Result<Option<RemoteEndpoint>, ResolveError> {
+    if !spec.uses_remote_backend() {
+        return Ok(None);
+    }
+
+    spec.remote_endpoint()
+        .map_err(|error| ResolveError::InvalidRemoteEndpointConfig {
+            agent_id: spec.id.clone(),
+            backend: spec.backend.kind.clone(),
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| ResolveError::InvalidRemoteEndpointConfig {
+            agent_id: spec.id.clone(),
+            backend: spec.backend.kind.clone(),
+            message: "backend config must include a valid remote endpoint shape".to_string(),
+        })
+        .map(Some)
+}
+
+// ---------------------------------------------------------------------------
+// AgentResolver implementation
+// ---------------------------------------------------------------------------
+
+/// Resolver that bridges a fixed `RegistrySet` into `AgentResolver`.
+///
+/// Separates the registry aggregation concern (`RegistrySet`) from the
+/// resolution logic. `RegistrySet` stays a pure data container.
+pub struct RegistrySetResolver {
+    registries: RegistrySet,
+    replayable_snapshot: bool,
+}
+
+impl RegistrySetResolver {
+    #[must_use]
+    pub fn new(registries: RegistrySet) -> Self {
+        Self {
+            registries,
+            replayable_snapshot: false,
+        }
+    }
+
+    #[must_use]
+    pub fn new_replayable_snapshot(registries: RegistrySet) -> Self {
+        Self {
+            registries,
+            replayable_snapshot: true,
+        }
+    }
+}
+
+impl AgentResolver for RegistrySetResolver {
+    fn resolve(&self, agent_id: &str) -> Result<ResolvedAgent, RuntimeError> {
+        resolve_registry_set(&self.registries, agent_id).map_err(|e| RuntimeError::ResolveFailed {
+            message: e.to_string(),
+        })
+    }
+
+    fn resolve_execution(&self, agent_id: &str) -> Result<ExecutionPlan, RuntimeError> {
+        resolve_execution_registry_set(&self.registries, agent_id).map_err(|error| {
+            RuntimeError::ResolveFailed {
+                message: error.to_string(),
+            }
+        })
+    }
+
+    fn agent_ids(&self) -> Vec<String> {
+        self.registries.agents.agent_ids()
+    }
+}
+
+#[async_trait]
+impl Resolver for RegistrySetResolver {
+    async fn resolve(
+        &self,
+        request: ResolutionRequest,
+    ) -> Result<ResolvedRunPlan, RunResolveError> {
+        if matches!(request.resolution_scope, RegistryResolutionScope::Pinned(_))
+            && !self.replayable_snapshot
+        {
+            return Err(RunResolveError::UnsupportedPersistence(
+                "pinned registry resolution requires a materialized replayable snapshot".into(),
+            ));
+        }
+        let (agent_id, role) = target_agent_and_role(&request.target);
+        let agent_id = agent_id.to_string();
+        let execution = resolve_execution_registry_set(&self.registries, &agent_id)
+            .map_err(|error| RunResolveError::Runtime(error.to_string()))?;
+        ResolvedRunPlan::from_execution_for_request(execution, role, request)
+    }
+}
+
+fn target_agent_and_role(target: &ResolutionTarget) -> (&str, ExecutionRole) {
+    match target {
+        ResolutionTarget::Root { agent_id, .. } => (agent_id.as_str(), ExecutionRole::Root),
+        ResolutionTarget::Delegate { agent_id, .. } => (agent_id.as_str(), ExecutionRole::Delegate),
+        ResolutionTarget::Handoff { agent_id, .. } => (agent_id.as_str(), ExecutionRole::Handoff),
+    }
+}
+
+/// Resolver backed by a versioned registry handle.
+///
+/// Each call resolves against the current published registry snapshot,
+/// allowing callers to swap registry contents without replacing the runtime.
+pub(crate) struct DynamicRegistryResolver {
+    handle: RegistryHandle,
+}
+
+impl DynamicRegistryResolver {
+    pub(crate) fn new(handle: RegistryHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl AgentResolver for DynamicRegistryResolver {
+    fn resolve(&self, agent_id: &str) -> Result<ResolvedAgent, RuntimeError> {
+        let snapshot = self.handle.snapshot();
+        resolve_registry_set(snapshot.registries(), agent_id).map_err(|e| {
+            RuntimeError::ResolveFailed {
+                message: e.to_string(),
+            }
+        })
+    }
+
+    fn resolve_execution(&self, agent_id: &str) -> Result<ExecutionPlan, RuntimeError> {
+        let snapshot = self.handle.snapshot();
+        resolve_execution_registry_set(snapshot.registries(), agent_id).map_err(|error| {
+            RuntimeError::ResolveFailed {
+                message: error.to_string(),
+            }
+        })
+    }
+
+    fn agent_ids(&self) -> Vec<String> {
+        self.handle.snapshot().registries().agents.agent_ids()
+    }
+}
+
+#[async_trait]
+impl Resolver for DynamicRegistryResolver {
+    async fn resolve(
+        &self,
+        request: ResolutionRequest,
+    ) -> Result<ResolvedRunPlan, RunResolveError> {
+        let snapshot = self.handle.snapshot();
+        let resolver = if matches!(request.resolution_scope, RegistryResolutionScope::Pinned(_)) {
+            RegistrySetResolver::new_replayable_snapshot(snapshot.into_registries())
+        } else {
+            RegistrySetResolver::new(snapshot.into_registries())
+        };
+        Resolver::resolve(&resolver, request).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Validate spec sections against plugin-declared JSON Schemas.
+///
+/// For each plugin that declares `config_schemas()`, validates the
+/// corresponding section in `AgentSpec.sections` against its JSON Schema.
+/// Missing sections are fine (plugins fall back to defaults). Invalid
+/// sections produce `ResolveError::InvalidPluginConfig`.
+///
+/// Also logs a warning for any section keys not claimed by any plugin.
+fn validate_sections(spec: &AgentSpec, plugins: &[Arc<dyn Plugin>]) -> Result<(), ResolveError> {
+    let mut claimed_keys: HashSet<&str> = HashSet::new();
+
+    for plugin in plugins {
+        let schemas = plugin.config_schemas();
+        for schema in &schemas {
+            claimed_keys.insert(schema.key);
+            if let Some(value) = spec.sections.get(schema.key) {
+                jsonschema::validate(&schema.json_schema, value).map_err(|e| {
+                    ResolveError::InvalidPluginConfig {
+                        plugin: plugin.descriptor().name.into(),
+                        key: schema.key.into(),
+                        message: e.to_string(),
+                    }
+                })?;
+            }
+        }
+    }
+
+    // Warn about unclaimed section keys
+    for key in spec.sections.keys() {
+        if !claimed_keys.contains(key.as_str()) {
+            tracing::warn!(
+                agent_id = %spec.id,
+                key = %key,
+                "section key not claimed by any plugin — possible typo"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect all global (builder-registered) tools from the registry.
+fn collect_global_tools(registries: &RegistrySet) -> HashMap<String, Arc<dyn Tool>> {
+    let mut tools = HashMap::new();
+    for id in registries.tools.tool_ids() {
+        if let Some(tool) = registries.tools.get_tool(&id) {
+            tools.insert(id, tool);
+        }
+    }
+    tools
+}
+
+/// Resolve plugins by IDs from the spec.
+fn resolve_plugins(
+    registries: &RegistrySet,
+    spec: &AgentSpec,
+) -> Result<Vec<Arc<dyn Plugin>>, ResolveError> {
+    spec.plugin_ids
+        .iter()
+        .map(|id| {
+            registries
+                .plugins
+                .get_plugin(id)
+                .ok_or_else(|| ResolveError::PluginNotFound(id.clone()))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod capability_tests;
+#[cfg(test)]
+mod tests;

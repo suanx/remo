@@ -1,0 +1,29 @@
+[package]
+name = "remo-ext-permission"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Permission plugin with allow/deny/ask policies for Remo tool execution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "security"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+remo-tool-pattern = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+glob-match = { workspace = true }
+regex = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

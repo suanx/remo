@@ -1,0 +1,35 @@
+//! Context management: compaction, summarization, truncation, and plugin state.
+
+pub mod compaction;
+pub mod effective_policy;
+pub mod plugin;
+pub mod summarizer;
+pub mod transform;
+pub mod truncation;
+
+pub use compaction::{
+    AppliedCompaction, COMPACTION_COMPLETED_EVENT, COMPACTION_FAILED_EVENT,
+    COMPACTION_SKIP_REASON_MIN_SAVINGS_RATIO, COMPACTION_SKIPPED_EVENT, COMPACTION_STARTED_EVENT,
+    CompactionPlan, apply_summary, clear_compaction_in_flight, compaction_savings_ratio_ppm,
+    find_compaction_boundary, plan_compaction, record_compaction_boundary,
+    record_compaction_failure, record_compaction_in_flight, record_compaction_skipped,
+    summary_message_tokens, trim_to_compaction_boundary, try_consume_compaction_event,
+};
+pub use effective_policy::effective_policy;
+pub use plugin::{
+    CONTEXT_COMPACTION_PLUGIN_ID, CONTEXT_TRANSFORM_PLUGIN_ID, CompactionAction,
+    CompactionBoundary, CompactionConfig, CompactionConfigKey, CompactionExecutionMode,
+    CompactionFailure, CompactionInFlight, CompactionPlugin, CompactionRawRetention,
+    CompactionSkipped, CompactionState, CompactionStateKey, ContextTransformConfig,
+    ContextTransformConfigKey, ContextTransformPlugin, KNOWLEDGE_CUTOFF_PLUGIN_ID,
+    KnowledgeCutoffConfig, KnowledgeCutoffConfigKey, KnowledgeCutoffPlugin,
+};
+pub use summarizer::{
+    ContextSummarizer, DefaultSummarizer, MIN_COMPACTION_GAIN_TOKENS, SummarizationError,
+    extract_previous_summary, render_transcript,
+};
+pub use transform::{
+    ArtifactCompactionConfig, ContextTransform, compact_artifact, compact_artifact_with_config,
+    compact_tool_results, compact_tool_results_with_config,
+};
+pub use truncation::{TruncationState, continuation_message, should_retry};

@@ -1,0 +1,26 @@
+[package]
+name = "remo-ext-agnes"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Agnes AI Gateway 集成 — 免费 AI API 平台，OpenAI 兼容协议"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

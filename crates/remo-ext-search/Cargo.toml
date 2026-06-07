@@ -1,0 +1,29 @@
+[package]
+name = "remo-ext-search"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "Web search extension with multi-provider support (Tavily, SerpAPI, Bing, Google) for the Remo AI Agent framework"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "web-programming"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

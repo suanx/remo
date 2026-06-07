@@ -1,0 +1,45 @@
+[package]
+name = "remo-ext-observability"
+version.workspace = true
+readme = "../../README.md"
+edition.workspace = true
+description = "OpenTelemetry observability plugin with GenAI semantic conventions for Remo"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "development-tools"]
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-runtime = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+metrics = { workspace = true }
+
+# Optional OTel
+opentelemetry = { version = "0.28", optional = true }
+opentelemetry_sdk = { version = "0.28", optional = true }
+opentelemetry-otlp = { version = "0.28", optional = true, default-features = false, features = ["http-proto", "reqwest-blocking-client"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time"] }
+futures = { workspace = true }
+futures-util = "0.3"
+tracing-core = "0.1"
+tracing-subscriber = { workspace = true, features = ["fmt", "registry"] }
+metrics-exporter-prometheus = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
+[lints]
+workspace = true

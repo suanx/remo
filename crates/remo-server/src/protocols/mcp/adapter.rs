@@ -1,0 +1,383 @@
+//! Adapter: wraps Remo agents as MCP tools.
+//!
+//! Each registered agent becomes one `McpTool` whose `call()` runs the agent
+//! loop, collects the final assistant text, and returns it as `ToolContent`.
+//!
+//! Logging notifications are forwarded via the MCP server's outbound channel
+//! so that clients can observe long-running agent runs.
+
+use std::sync::Arc;
+
+use mcp::protocol::{JsonRpcNotification, McpToolDefinition, ServerOutbound, ToolContent};
+use mcp::tool::{BoxFuture, McpTool, ToolCallResult};
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use remo_runtime::{AgentRuntime, RunActivation};
+use remo_server_contract::contract::event::AgentEvent;
+use remo_server_contract::contract::lifecycle::TerminationReason;
+use remo_server_contract::contract::message::Message;
+use remo_server_contract::contract::storage::RunRequestOrigin;
+use remo_server_contract::contract::tool_intercept::AdapterKind;
+
+use super::JSON_RPC_VERSION;
+use crate::mailbox::Mailbox;
+use crate::transport::channel_sink::ChannelEventSink;
+
+enum McpEventReceiver {
+    Bounded(mpsc::Receiver<AgentEvent>),
+    Unbounded(mpsc::UnboundedReceiver<AgentEvent>),
+}
+
+impl McpEventReceiver {
+    async fn recv(&mut self) -> Option<AgentEvent> {
+        match self {
+            Self::Bounded(rx) => rx.recv().await,
+            Self::Unbounded(rx) => rx.recv().await,
+        }
+    }
+}
+
+/// An MCP tool backed by an Remo agent.
+///
+/// Calling this tool sends a user message to the agent, runs the full agent
+/// loop, and returns the final assistant text as `ToolContent::text`.
+///
+/// If `outbound_tx` is set, structured logging notifications are sent during
+/// execution.
+pub struct AgentMcpTool {
+    agent_id: String,
+    description: String,
+    runtime: Arc<AgentRuntime>,
+    mailbox: Option<Arc<Mailbox>>,
+    outbound_tx: Option<mpsc::Sender<ServerOutbound>>,
+}
+
+impl AgentMcpTool {
+    pub fn new(agent_id: String, description: String, runtime: Arc<AgentRuntime>) -> Self {
+        Self {
+            agent_id,
+            description,
+            runtime,
+            mailbox: None,
+            outbound_tx: None,
+        }
+    }
+
+    pub fn new_with_mailbox(
+        agent_id: String,
+        description: String,
+        runtime: Arc<AgentRuntime>,
+        mailbox: Arc<Mailbox>,
+    ) -> Self {
+        Self {
+            agent_id,
+            description,
+            runtime,
+            mailbox: Some(mailbox),
+            outbound_tx: None,
+        }
+    }
+
+    /// Attach the MCP server's outbound channel for sending logging notifications.
+    pub fn with_outbound(mut self, tx: mpsc::Sender<ServerOutbound>) -> Self {
+        self.outbound_tx = Some(tx);
+        self
+    }
+
+    /// Send a log notification via the MCP server's outbound channel.
+    async fn send_log(&self, level: &str, message: &str) {
+        if let Some(tx) = &self.outbound_tx {
+            let params = serde_json::json!({
+                "level": level,
+                "logger": format!("agent/{}", self.agent_id),
+                "data": message,
+            });
+            let notification = JsonRpcNotification {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "notifications/message".to_string(),
+                params: Some(params),
+            };
+            let _ = tx.send(ServerOutbound::Notification(notification)).await;
+        }
+    }
+}
+
+fn terminal_failure_for_mcp(
+    termination: Option<&TerminationReason>,
+    stream_error: Option<&str>,
+    requires_terminal_event: bool,
+) -> Option<String> {
+    if let Some(error) = stream_error {
+        return Some(format!("agent run failed: {error}"));
+    }
+    match termination {
+        Some(TerminationReason::NaturalEnd)
+        | Some(TerminationReason::BehaviorRequested)
+        | Some(TerminationReason::Stopped(_)) => None,
+        Some(TerminationReason::Cancelled) => Some("agent run cancelled".to_string()),
+        Some(TerminationReason::Blocked(reason)) => Some(format!("agent run blocked: {reason}")),
+        Some(TerminationReason::Suspended) => Some("agent run suspended".to_string()),
+        Some(TerminationReason::Error(reason)) => Some(format!("agent run failed: {reason}")),
+        None if requires_terminal_event => {
+            Some("agent run ended without terminal status".to_string())
+        }
+        None => None,
+    }
+}
+
+impl McpTool for AgentMcpTool {
+    fn definition(&self) -> McpToolDefinition {
+        McpToolDefinition::new(&self.agent_id)
+            .with_description(&self.description)
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The user message to send to the agent"
+                    }
+                },
+                "required": ["message"]
+            }))
+    }
+
+    fn call<'a>(&'a self, args: Value) -> BoxFuture<'a, ToolCallResult> {
+        Box::pin(async move {
+            let text = args
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            if text.is_empty() {
+                return Err("'message' parameter is required and must be non-empty".to_string());
+            }
+
+            let thread_id = format!("mcp-{}", uuid::Uuid::now_v7());
+            let messages = vec![Message::user(&text)];
+            let request = RunActivation::new(thread_id, messages)
+                .with_agent_id(self.agent_id.clone())
+                .with_origin(RunRequestOrigin::Mcp)
+                .with_adapter(AdapterKind::Mcp);
+
+            self.send_log("info", "starting agent run").await;
+
+            let (mut event_rx, run_handle, requires_terminal_event) =
+                if let Some(mailbox) = self.mailbox.as_ref() {
+                    let (_submission, event_rx) = mailbox
+                        .submit(request)
+                        .await
+                        .map_err(|error| format!("agent run failed: {error}"))?;
+                    (McpEventReceiver::Bounded(event_rx), None, true)
+                } else {
+                    let (event_tx, event_rx) = mpsc::unbounded_channel();
+                    let sink = Arc::new(ChannelEventSink::new(event_tx));
+                    let runtime = Arc::clone(&self.runtime);
+                    let run_handle = tokio::spawn(async move { runtime.run(request, sink).await });
+                    (
+                        McpEventReceiver::Unbounded(event_rx),
+                        Some(run_handle),
+                        false,
+                    )
+                };
+
+            // Collect text deltas and emit logs from agent events.
+            let mut assistant_text = String::new();
+            let mut step_count: u32 = 0;
+            let mut terminal: Option<TerminationReason> = None;
+            let mut stream_error: Option<String> = None;
+            while let Some(event) = event_rx.recv().await {
+                match &event {
+                    AgentEvent::RunFinish { termination, .. } => {
+                        terminal = Some(termination.clone());
+                    }
+                    AgentEvent::Error { message, .. } => {
+                        stream_error = Some(message.clone());
+                    }
+                    AgentEvent::TextDelta { delta } => {
+                        assistant_text.push_str(delta);
+                    }
+                    AgentEvent::StepStart { .. } => {
+                        step_count += 1;
+                        self.send_log("info", &format!("step {step_count}")).await;
+                    }
+                    AgentEvent::ToolCallStart { name, .. } => {
+                        self.send_log("info", &format!("calling tool: {name}"))
+                            .await;
+                    }
+                    AgentEvent::ToolCallDone { result, .. } => {
+                        let status = if result.is_success() {
+                            "success"
+                        } else {
+                            "error"
+                        };
+                        self.send_log(
+                            "info",
+                            &format!("tool {} completed: {status}", result.tool_name),
+                        )
+                        .await;
+                    }
+                    AgentEvent::InferenceComplete {
+                        model, duration_ms, ..
+                    } => {
+                        self.send_log(
+                            "debug",
+                            &format!("inference complete: model={model} duration={duration_ms}ms"),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(run_handle) = run_handle {
+                match run_handle.await {
+                    Ok(Ok(_)) => {
+                        self.send_log("notice", "completed").await;
+                    }
+                    Ok(Err(e)) => {
+                        self.send_log("error", &format!("agent run failed: {e}"))
+                            .await;
+                        return Err(format!("agent run failed: {e}"));
+                    }
+                    Err(e) => {
+                        return Err(format!("agent task panicked: {e}"));
+                    }
+                }
+            } else {
+                if let Some(error) = terminal_failure_for_mcp(
+                    terminal.as_ref(),
+                    stream_error.as_deref(),
+                    requires_terminal_event,
+                ) {
+                    self.send_log("error", &error).await;
+                    return Err(error);
+                }
+                self.send_log("notice", "completed").await;
+            }
+
+            if assistant_text.is_empty() {
+                assistant_text = "(no response)".to_string();
+            }
+
+            Ok(vec![ToolContent::text(assistant_text)])
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remo_runtime::{AgentResolver, AgentRuntime, ResolvedAgent, RuntimeError};
+    use serde_json::json;
+
+    struct StubResolver;
+    impl AgentResolver for StubResolver {
+        fn resolve(&self, agent_id: &str) -> Result<ResolvedAgent, RuntimeError> {
+            Err(RuntimeError::AgentNotFound {
+                agent_id: agent_id.to_string(),
+            })
+        }
+
+        fn agent_ids(&self) -> Vec<String> {
+            vec!["test-agent".to_string()]
+        }
+    }
+
+    fn test_runtime() -> Arc<AgentRuntime> {
+        Arc::new(AgentRuntime::new(Arc::new(StubResolver)))
+    }
+
+    #[test]
+    fn definition_has_correct_name_and_schema() {
+        let tool = AgentMcpTool::new(
+            "my-agent".to_string(),
+            "A test agent".to_string(),
+            test_runtime(),
+        );
+        let def = tool.definition();
+        assert_eq!(def.name, "my-agent");
+        assert_eq!(def.description.as_deref(), Some("A test agent"));
+        let schema = &def.input_schema;
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["message"].is_object());
+    }
+
+    #[test]
+    fn mailbox_terminal_failure_rejects_missing_terminal_status() {
+        let error = terminal_failure_for_mcp(None, None, true).unwrap();
+        assert!(error.contains("terminal status"));
+    }
+
+    #[test]
+    fn mailbox_terminal_failure_rejects_failed_run_finish() {
+        let error = terminal_failure_for_mcp(
+            Some(&TerminationReason::Error("provider failed".to_string())),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(error.contains("provider failed"));
+    }
+
+    #[test]
+    fn mailbox_terminal_failure_allows_successful_run_finish() {
+        assert!(
+            terminal_failure_for_mcp(Some(&TerminationReason::NaturalEnd), None, true).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn call_rejects_empty_message() {
+        let tool = AgentMcpTool::new("my-agent".to_string(), "test".to_string(), test_runtime());
+        let result = tool.call(json!({"message": ""})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-empty"));
+    }
+
+    #[tokio::test]
+    async fn call_rejects_missing_message() {
+        let tool = AgentMcpTool::new("my-agent".to_string(), "test".to_string(), test_runtime());
+        let result = tool.call(json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn call_with_unresolvable_agent_returns_error() {
+        let tool = AgentMcpTool::new(
+            "nonexistent".to_string(),
+            "test".to_string(),
+            test_runtime(),
+        );
+        let result = tool.call(json!({"message": "hello"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn logging_notifications_are_sent() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let tool = AgentMcpTool::new("test-agent".to_string(), "test".to_string(), test_runtime())
+            .with_outbound(tx);
+
+        // Call will fail (stub resolver), but logs should be sent first.
+        let _ = tool.call(json!({"message": "hello"})).await;
+
+        // Collect all notifications.
+        let mut notifications = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let ServerOutbound::Notification(n) = msg {
+                notifications.push(n);
+            }
+        }
+
+        // Should have at least one structured logging notification.
+        assert!(
+            notifications
+                .iter()
+                .any(|n| n.method == "notifications/message"),
+            "expected at least one logging notification, got: {notifications:?}"
+        );
+    }
+}
