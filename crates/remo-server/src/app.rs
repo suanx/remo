@@ -306,8 +306,8 @@ impl Default for ServerConfig {
         }
     }
 }
-}
 
+#[derive(Clone)]
 #[derive(Clone)]
 pub struct ServerState {
     pub run: RunModuleState,
