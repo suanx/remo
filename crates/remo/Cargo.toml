@@ -1,0 +1,82 @@
+[package]
+name = "remo"
+version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/remo"
+edition.workspace = true
+description = "Rust AI agent backend: build capabilities once, tune behavior live, serve every client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["artificial-intelligence", "asynchronous"]
+
+[lib]
+name = "remo"
+
+[dependencies]
+remo-runtime-contract = { workspace = true }
+remo-server-contract = { workspace = true }
+remo-runtime = { workspace = true }
+remo-ext-permission = { workspace = true, optional = true }
+remo-ext-observability = { workspace = true, optional = true }
+remo-ext-mcp = { workspace = true, optional = true }
+remo-ext-skills = { workspace = true, optional = true }
+remo-ext-reminder = { workspace = true, optional = true }
+remo-ext-generative-ui = { workspace = true, optional = true }
+remo-ext-deferred-tools = { workspace = true, optional = true }
+remo-ext-sandbox = { workspace = true, optional = true }
+remo-ext-rag = { workspace = true, optional = true }
+remo-ext-workflow = { workspace = true, optional = true }
+remo-ext-memory = { workspace = true, optional = true }
+remo-ext-multimodal = { workspace = true, optional = true }
+remo-ext-playground = { workspace = true, optional = true }
+remo-ext-search = { workspace = true, optional = true }
+remo-ext-evaluator = { workspace = true, optional = true }
+remo-ext-notifications = { workspace = true, optional = true }
+remo-ext-voice = { workspace = true, optional = true }
+remo-ext-opencode = { workspace = true, optional = true }
+remo-ext-xfyun = { workspace = true, optional = true }
+remo-ext-agnes = { workspace = true, optional = true }
+remo-ext-media-gen = { workspace = true, optional = true }
+remo-stores = { workspace = true }
+remo-server = { workspace = true, optional = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["full"]
+permission = ["dep:remo-ext-permission"]
+observability = ["dep:remo-ext-observability"]
+mcp = ["dep:remo-ext-mcp"]
+skills = ["dep:remo-ext-skills"]
+reminder = ["dep:remo-ext-reminder"]
+generative-ui = ["dep:remo-ext-generative-ui"]
+deferred-tools = ["dep:remo-ext-deferred-tools"]
+server = ["dep:remo-server"]
+memory = ["dep:remo-ext-memory"]
+rag = ["dep:remo-ext-rag"]
+multimodal = ["dep:remo-ext-multimodal"]
+workflow = ["dep:remo-ext-workflow"]
+sandbox = ["dep:remo-ext-sandbox"]
+playground = ["dep:remo-ext-playground"]
+search = ["dep:remo-ext-search"]
+evaluator = ["dep:remo-ext-evaluator"]
+notifications = ["dep:remo-ext-notifications"]
+voice = ["dep:remo-ext-voice"]
+opencode = ["dep:remo-ext-opencode"]
+xfyun = ["dep:remo-ext-xfyun"]
+agnes = ["dep:remo-ext-agnes"]
+media-gen = ["dep:remo-ext-media-gen"]
+full = ["permission", "observability", "mcp", "skills", "reminder", "deferred-tools", "server", "generative-ui", "memory", "rag", "multimodal", "workflow", "sandbox", "playground", "search", "evaluator", "notifications", "voice", "opencode", "xfyun", "agnes", "media-gen"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+genai = { workspace = true }
+remo-runtime = { workspace = true }
+
+[lints]
+workspace = true
