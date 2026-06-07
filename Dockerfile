@@ -145,16 +145,11 @@ RUN cargo build --package=remo-server --release
 # ── 运行阶段 ──────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# 运行时系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     wget \
     && rm -rf /var/lib/apt/lists/*
-
-# 创建非 root 用户
-RUN groupadd --gid 10001 remo && \
-    useradd --uid 10001 --gid remo --shell /sbin/nologin --create-home remo
 
 WORKDIR /app
 COPY --from=builder /app/target/release/remo-server /app/remo-server
@@ -162,11 +157,8 @@ COPY --from=frontend-builder /app/frontend/dist /app/static
 
 ENV REMO_STATIC_DIR=/app/static
 
-USER remo
-
 EXPOSE 3000
 
-# 健康检查：请求 /health 端点（axum 内置 200 OK）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/health || exit 1
 
