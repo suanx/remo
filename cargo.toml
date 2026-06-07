@@ -70,8 +70,13 @@ remo-ext-search = { version = "0.5.1-dev", path = "crates/remo-ext-search" }
 remo-ext-evaluator = { version = "0.5.1-dev", path = "crates/remo-ext-evaluator" }
 remo-ext-notifications = { version = "0.5.1-dev", path = "crates/remo-ext-notifications" }
 remo-ext-voice = { version = "0.5.1-dev", path = "crates/remo-ext-voice" }
+remo-ext-opencode = { version = "0.5.1-dev", path = "crates/remo-ext-opencode" }
+remo-ext-xfyun = { version = "0.5.1-dev", path = "crates/remo-ext-xfyun" }
+remo-ext-agnes = { version = "0.5.1-dev", path = "crates/remo-ext-agnes" }
+remo-ext-media-gen = { version = "0.5.1-dev", path = "crates/remo-ext-media-gen" }
 remo-tool-pattern = { version = "0.5.1-dev", path = "crates/remo-tool-pattern" }
 remo-server = { version = "0.5.1-dev", path = "crates/remo-server" }
+glob-match = "0.2"
 glob-match = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive", "rc"] }
