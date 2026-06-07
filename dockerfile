@@ -9,8 +9,8 @@ FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 
 # 复制依赖清单并安装（利用 Docker 缓存层）
-COPY packages/awaken-app/package.json packages/awaken-app/package-lock.json* ./
-RUN npm ci
+COPY packages/awaken-app/package.json ./
+RUN npm install
 
 # 复制前端源码并构建
 COPY packages/awaken-app/ .
