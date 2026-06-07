@@ -308,7 +308,6 @@ impl Default for ServerConfig {
 }
 
 #[derive(Clone)]
-#[derive(Clone)]
 pub struct ServerState {
     pub run: RunModuleState,
     pub config: Option<ConfigModuleState>,
