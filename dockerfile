@@ -132,8 +132,9 @@ RUN mkdir -p crates/remo-server/src && \
           crates/remo-doctest/src/lib.rs \
           crates/remo-eval/src/lib.rs
 # 编译所有依赖（生成可缓存中间产物）
-RUN cargo fetch --locked && \
-    cargo build --package=remo-server --release --locked
+# fetch 必须成功（保证依赖可下载）；build 允许失败（假源码只会占位）
+RUN cargo fetch && \
+    cargo build --package=remo-server --release 2>&1 || true
 
 # 复制完整源码（覆盖伪 src）
 COPY . .
