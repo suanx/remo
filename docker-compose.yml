@@ -5,8 +5,8 @@ services:
     ports: ["3000:3000"]
     restart: unless-stopped
     environment:
-      - REMO_ADMIN_API_BEARER_TOKEN=${REMO_ADMIN_API_BEARER_TOKEN:-please-set-this-env-var}
-      - REMO_DATA_DIR=${REMO_DATA_DIR:-/data}
+      - REMO_ADMIN_API_BEARER_TOKEN=changeme-secret-token
+      - REMO_DATA_DIR=/data
     volumes: [remo-data:/data]
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/health
