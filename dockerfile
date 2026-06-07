@@ -66,6 +66,39 @@ COPY crates/remo-eval/Cargo.toml crates/remo-eval/
 # 创建伪 src 入口，使 cargo 能解析工作区并编译依赖
 RUN mkdir -p crates/remo-server/src && \
     echo "fn main() {}" > crates/remo-server/src/main.rs && \
+    mkdir -p \
+        crates/remo/src \
+        crates/remo-agent/src \
+        crates/remo-contract/src \
+        crates/remo-runtime-contract/src \
+        crates/remo-server-contract/src \
+        crates/remo-protocol-a2a/src \
+        crates/remo-stores/src \
+        crates/remo-runtime/src \
+        crates/remo-ext-permission/src \
+        crates/remo-ext-observability/src \
+        crates/remo-ext-mcp/src \
+        crates/remo-ext-skills/src \
+        crates/remo-ext-reminder/src \
+        crates/remo-ext-generative-ui/src \
+        crates/remo-ext-deferred-tools/src \
+        crates/remo-ext-sandbox/src \
+        crates/remo-ext-rag/src \
+        crates/remo-ext-workflow/src \
+        crates/remo-ext-memory/src \
+        crates/remo-ext-multimodal/src \
+        crates/remo-ext-playground/src \
+        crates/remo-ext-search/src \
+        crates/remo-ext-evaluator/src \
+        crates/remo-ext-notifications/src \
+        crates/remo-ext-voice/src \
+        crates/remo-ext-opencode/src \
+        crates/remo-ext-xfyun/src \
+        crates/remo-ext-agnes/src \
+        crates/remo-ext-media-gen/src \
+        crates/remo-tool-pattern/src \
+        crates/remo-doctest/src \
+        crates/remo-eval/src && \
     touch crates/remo/src/lib.rs \
           crates/remo-agent/src/lib.rs \
           crates/remo-contract/src/lib.rs \
@@ -98,7 +131,6 @@ RUN mkdir -p crates/remo-server/src && \
           crates/remo-tool-pattern/src/lib.rs \
           crates/remo-doctest/src/lib.rs \
           crates/remo-eval/src/lib.rs
-
 # 编译所有依赖（生成可缓存中间产物）
 RUN cargo fetch --locked && \
     cargo build --package=remo-server --release --locked 2>&1 || true
